@@ -5,7 +5,9 @@ name: Build FlowSnap APK
 # into an installable .apk. The repo needs nothing but this file.
 #
 #   Actions -> Build FlowSnap APK -> Run workflow
-#   then download the "FlowSnap-apk" artifact at the bottom of the run.
+#   then download the "FlowSnap-apk" artifact -> FlowSnap.apk -> install it.
+#
+# Produces ONE installable APK (debug-signed, works on any Android 7+ phone).
 
 on:
   push:
@@ -2568,54 +2570,30 @@ jobs:
           FLOWSNAP_EOF
 
 
-      # ---- optional release signing -------------------------------------
-      # Add repo secrets KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS /
-      # KEY_PASSWORD to sign the release APK with your own key:
-      #   keytool -genkey -v -keystore flowsnap.jks -keyalg RSA -keysize 2048 \
-      #           -validity 10000 -alias flowsnap
-      #   base64 -w0 flowsnap.jks     # paste output into KEYSTORE_BASE64
-      - name: Decode keystore
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-        if: env.KEYSTORE_BASE64 != ''
-        run: |
-          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/flowsnap.jks"
-          {
-            echo "FLOWSNAP_STORE_FILE=$RUNNER_TEMP/flowsnap.jks"
-            echo "FLOWSNAP_STORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}"
-            echo "FLOWSNAP_KEY_ALIAS=${{ secrets.KEY_ALIAS }}"
-            echo "FLOWSNAP_KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}"
-          } >> "$GITHUB_ENV"
-
       - name: Show generated tree
         working-directory: build-src
         run: find . -type f | sort
 
-      - name: Build debug APK
+      - name: Build APK
         working-directory: build-src
         run: gradle :app:assembleDebug --no-daemon --stacktrace
 
-      - name: Build release APK
-        working-directory: build-src
-        run: gradle :app:assembleRelease --no-daemon --stacktrace
-
-      - name: Collect APKs
+      - name: Collect APK
         run: |
           mkdir -p artifacts
-          cp build-src/app/build/outputs/apk/debug/app-debug.apk artifacts/FlowSnap-debug.apk
-          cp build-src/app/build/outputs/apk/release/app-release.apk artifacts/FlowSnap-release.apk
+          cp build-src/app/build/outputs/apk/debug/app-debug.apk artifacts/FlowSnap.apk
           ls -lh artifacts
 
-      - name: Upload APKs
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: FlowSnap-apk
-          path: artifacts/*.apk
-          retention-days: 30
+          path: artifacts/FlowSnap.apk
+          retention-days: 90
           if-no-files-found: error
 
-      - name: Attach APKs to release
+      - name: Attach APK to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.apk
+          files: artifacts/FlowSnap.apk
