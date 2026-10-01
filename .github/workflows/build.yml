@@ -1,0 +1,2611 @@
+name: Build FlowSnap APK
+
+# One-file Android build: this workflow GENERATES the whole FlowSnap
+# Instagram-downloader project (Kotlin + Jetpack Compose) and compiles it
+# into an installable .apk. The repo needs nothing but this file.
+#
+#   Actions -> Build FlowSnap APK -> Run workflow
+#   then download the "FlowSnap-apk" artifact at the bottom of the run.
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+  release:
+    types: [ published ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Generate project and assemble APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Create project folders
+        run: |
+          rm -rf build-src
+          mkdir -p build-src/app/src/main/java/com/flowsnap/app/data
+          mkdir -p build-src/app/src/main/java/com/flowsnap/app/ui/theme
+          mkdir -p build-src/app/src/main/java/com/flowsnap/app/ui/screens
+          mkdir -p build-src/app/src/main/java/com/flowsnap/app/ui/components
+          mkdir -p build-src/app/src/main/res/values
+          mkdir -p build-src/app/src/main/res/drawable
+          mkdir -p build-src/app/src/main/res/mipmap-anydpi-v26
+
+      - name: Write Gradle build files
+        working-directory: build-src
+        run: |
+          cat > settings.gradle.kts <<'FLOWSNAP_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FlowSnap"
+          include(":app")
+          FLOWSNAP_EOF
+
+          cat > build.gradle.kts <<'FLOWSNAP_EOF'
+          plugins {
+              id("com.android.application") version "8.7.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          FLOWSNAP_EOF
+
+          cat > gradle.properties <<'FLOWSNAP_EOF'
+          org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          FLOWSNAP_EOF
+
+          cat > app/build.gradle.kts <<'FLOWSNAP_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.flowsnap.app"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.flowsnap.app"
+                  minSdk = 24
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0.0"
+                  vectorDrawables { useSupportLibrary = true }
+              }
+
+              signingConfigs {
+                  // Created only when the GitHub Actions workflow exported the keystore env vars.
+                  val storeFilePath = System.getenv("FLOWSNAP_STORE_FILE")
+                  if (!storeFilePath.isNullOrBlank() && file(storeFilePath).exists()) {
+                      create("release") {
+                          storeFile = file(storeFilePath)
+                          storePassword = System.getenv("FLOWSNAP_STORE_PASSWORD")
+                          keyAlias = System.getenv("FLOWSNAP_KEY_ALIAS")
+                          keyPassword = System.getenv("FLOWSNAP_KEY_PASSWORD")
+                      }
+                  }
+              }
+
+              buildTypes {
+                  debug {
+                      isMinifyEnabled = false
+                  }
+                  release {
+                      // Signed by the GitHub Actions workflow when secrets are present,
+                      // otherwise falls back to the debug key so the APK still installs.
+                      //
+                      // R8 is OFF by default so the very first CI run is guaranteed green.
+                      // Flip both flags to `true` (or build with -PminifyRelease=true) to
+                      // shrink the APK from ~17 MB to ~5 MB once you are up and running.
+                      val minify = (project.findProperty("minifyRelease") as String?)?.toBoolean() ?: false
+                      isMinifyEnabled = minify
+                      isShrinkResources = minify
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                      signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              packaging {
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                  }
+              }
+          }
+
+          dependencies {
+              val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
+              implementation(composeBom)
+
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+              implementation("androidx.navigation:navigation-compose:2.8.4")
+
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+
+              implementation("io.coil-kt:coil-compose:2.7.0")
+              implementation("io.coil-kt:coil-video:2.7.0")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+              debugImplementation("androidx.compose.ui:ui-tooling")
+          }
+          FLOWSNAP_EOF
+
+          cat > app/proguard-rules.pro <<'FLOWSNAP_EOF'
+          -dontwarn okhttp3.**
+          -dontwarn okio.**
+          -keep class com.flowsnap.app.data.** { *; }
+          -keepattributes Signature, InnerClasses, EnclosingMethod
+          FLOWSNAP_EOF
+
+
+      - name: Write AndroidManifest and resources
+        working-directory: build-src
+        run: |
+          cat > app/src/main/AndroidManifest.xml <<'FLOWSNAP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission
+                  android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="28" />
+              <uses-permission
+                  android:name="android.permission.READ_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="32" />
+
+              <application
+                  android:name=".FlowSnapApp"
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:supportsRtl="true"
+                  android:usesCleartextTraffic="false"
+                  android:theme="@style/Theme.FlowSnap">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:windowSoftInputMode="adjustResize"
+                      android:theme="@style/Theme.FlowSnap">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+
+                      <!-- "Share to FlowSnap" from Instagram / any app -->
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+
+                      <!-- Open instagram.com links with FlowSnap -->
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.BROWSABLE" />
+                          <data android:scheme="https" android:host="www.instagram.com" />
+                          <data android:scheme="https" android:host="instagram.com" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          FLOWSNAP_EOF
+
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'FLOWSNAP_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:aapt="http://schemas.android.com/aapt"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:pathData="M54,26L54,66M54,66L40,52M54,66L68,52"
+                  android:strokeWidth="7"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round">
+                  <aapt:attr name="android:strokeColor">
+                      <gradient
+                          android:startX="34" android:startY="26"
+                          android:endX="74" android:endY="70"
+                          android:type="linear">
+                          <item android:offset="0" android:color="#FF6A3DF5" />
+                          <item android:offset="0.5" android:color="#FFD946EF" />
+                          <item android:offset="1" android:color="#FFF43F5E" />
+                      </gradient>
+                  </aapt:attr>
+              </path>
+              <path
+                  android:pathData="M36,74L72,74"
+                  android:strokeWidth="7"
+                  android:strokeLineCap="round"
+                  android:strokeColor="#FFD946EF" />
+          </vector>
+          FLOWSNAP_EOF
+
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'FLOWSNAP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          FLOWSNAP_EOF
+
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml <<'FLOWSNAP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          FLOWSNAP_EOF
+
+          cat > app/src/main/res/values/colors.xml <<'FLOWSNAP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#1A0B2E</color>
+          </resources>
+          FLOWSNAP_EOF
+
+          cat > app/src/main/res/values/strings.xml <<'FLOWSNAP_EOF'
+          <resources>
+              <string name="app_name">FlowSnap</string>
+          </resources>
+          FLOWSNAP_EOF
+
+          cat > app/src/main/res/values/themes.xml <<'FLOWSNAP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.FlowSnap" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:statusBarColor">#0B0718</item>
+                  <item name="android:navigationBarColor">#0B0718</item>
+                  <item name="android:windowBackground">#0B0718</item>
+              </style>
+          </resources>
+          FLOWSNAP_EOF
+
+
+      - name: Write app source (data layer)
+        working-directory: build-src
+        run: |
+          cat > app/src/main/java/com/flowsnap/app/data/DownloadStore.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.data
+
+          import android.content.Context
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+
+          /** Tiny JSON-file backed store for the Downloads / Favorites screens. */
+          class DownloadStore(context: Context) {
+
+              private val file = File(context.filesDir, "downloads.json")
+              private val _items = MutableStateFlow<List<DownloadRecord>>(emptyList())
+              val items: StateFlow<List<DownloadRecord>> = _items
+
+              init {
+                  _items.value = load()
+              }
+
+              fun add(record: DownloadRecord) {
+                  _items.value = listOf(record) + _items.value
+                  persist()
+              }
+
+              fun remove(id: Long) {
+                  _items.value = _items.value.filterNot { it.id == id }
+                  persist()
+              }
+
+              fun toggleFavorite(id: Long) {
+                  _items.value = _items.value.map {
+                      if (it.id == id) it.copy(favorite = !it.favorite) else it
+                  }
+                  persist()
+              }
+
+              fun setCollection(id: Long, collection: String) {
+                  _items.value = _items.value.map {
+                      if (it.id == id) it.copy(collection = collection, favorite = true) else it
+                  }
+                  persist()
+              }
+
+              fun clearAll() {
+                  _items.value = emptyList()
+                  persist()
+              }
+
+              fun totalBytes(): Long = _items.value.sumOf { it.sizeBytes }
+
+              private fun persist() {
+                  runCatching {
+                      val arr = JSONArray()
+                      _items.value.forEach { r ->
+                          arr.put(
+                              JSONObject()
+                                  .put("id", r.id)
+                                  .put("fileName", r.fileName)
+                                  .put("localUri", r.localUri)
+                                  .put("remoteUrl", r.remoteUrl)
+                                  .put("thumbnailUrl", r.thumbnailUrl)
+                                  .put("kind", r.kind.name)
+                                  .put("sizeBytes", r.sizeBytes)
+                                  .put("createdAt", r.createdAt)
+                                  .put("username", r.username)
+                                  .put("favorite", r.favorite)
+                                  .put("collection", r.collection)
+                          )
+                      }
+                      file.writeText(arr.toString())
+                  }
+              }
+
+              private fun load(): List<DownloadRecord> = runCatching {
+                  if (!file.exists()) return emptyList()
+                  val arr = JSONArray(file.readText())
+                  (0 until arr.length()).mapNotNull { i ->
+                      val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                      DownloadRecord(
+                          id = o.optLong("id"),
+                          fileName = o.optString("fileName"),
+                          localUri = o.optString("localUri"),
+                          remoteUrl = o.optString("remoteUrl"),
+                          thumbnailUrl = o.optString("thumbnailUrl"),
+                          kind = runCatching { MediaKind.valueOf(o.optString("kind")) }
+                              .getOrDefault(MediaKind.PHOTO),
+                          sizeBytes = o.optLong("sizeBytes"),
+                          createdAt = o.optLong("createdAt"),
+                          username = o.optString("username"),
+                          favorite = o.optBoolean("favorite"),
+                          collection = o.optString("collection")
+                      )
+                  }
+              }.getOrDefault(emptyList())
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/data/Downloader.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.data
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.media.MediaScannerConnection
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Environment
+          import android.provider.MediaStore
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.withContext
+          import okhttp3.Request
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.io.OutputStream
+
+          data class Progress(val id: String, val fileName: String, val percent: Int, val done: Boolean = false)
+
+          object Downloader {
+
+              /** Live progress of the item currently downloading (null when idle). */
+              val progress = MutableStateFlow<Progress?>(null)
+
+              fun fileNameFor(post: ResolvedPost, item: MediaItem, index: Int): String {
+                  val stamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+                      .format(java.util.Date())
+                  val ext = if (item.kind == MediaKind.VIDEO) "mp4" else "jpg"
+                  val prefix = if (item.kind == MediaKind.VIDEO) {
+                      if (post.isReel) "reels" else "video"
+                  } else "photo"
+                  val suffix = if (post.items.size > 1) "_${index + 1}" else ""
+                  return "${prefix}_${stamp}$suffix.$ext"
+              }
+
+              /**
+               * Streams [variant] to the public gallery (Movies/FlowSnap or Pictures/FlowSnap)
+               * and returns a [DownloadRecord] describing the saved file.
+               */
+              suspend fun download(
+                  context: Context,
+                  post: ResolvedPost,
+                  item: MediaItem,
+                  variant: MediaVariant,
+                  fileName: String
+              ): Result<DownloadRecord> = withContext(Dispatchers.IO) {
+                  runCatching {
+                      progress.value = Progress(item.id, fileName, 0)
+
+                      val req = Request.Builder()
+                          .url(variant.url)
+                          .header("User-Agent", Net.UA)
+                          .header("Referer", "https://www.instagram.com/")
+                          .build()
+
+                      Net.client.newCall(req).execute().use { resp ->
+                          if (!resp.isSuccessful) error("Server returned HTTP ${resp.code}")
+                          val body = resp.body ?: error("Empty response")
+                          val total = body.contentLength()
+
+                          val sink = openSink(context, fileName, item.kind)
+                          var written = 0L
+                          body.byteStream().use { input ->
+                              sink.stream.use { output ->
+                                  val buf = ByteArray(DEFAULT_BUFFER_SIZE)
+                                  while (true) {
+                                      val read = input.read(buf)
+                                      if (read <= 0) break
+                                      output.write(buf, 0, read)
+                                      written += read
+                                      if (total > 0) {
+                                          progress.value = Progress(
+                                              item.id, fileName, ((written * 100) / total).toInt()
+                                          )
+                                      }
+                                  }
+                                  output.flush()
+                              }
+                          }
+                          sink.finish(context)
+                          progress.value = Progress(item.id, fileName, 100, done = true)
+
+                          DownloadRecord(
+                              id = System.currentTimeMillis(),
+                              fileName = fileName,
+                              localUri = sink.uri.toString(),
+                              remoteUrl = variant.url,
+                              thumbnailUrl = item.thumbnailUrl,
+                              kind = item.kind,
+                              sizeBytes = written,
+                              createdAt = System.currentTimeMillis(),
+                              username = post.username
+                          )
+                      }
+                  }.also { if (it.isFailure) progress.value = null }
+              }
+
+              private class Sink(val uri: Uri, val stream: OutputStream, val onFinish: (Context) -> Unit) {
+                  fun finish(context: Context) = onFinish(context)
+              }
+
+              private fun openSink(context: Context, fileName: String, kind: MediaKind): Sink {
+                  val isVideo = kind == MediaKind.VIDEO
+                  return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      val collection = if (isVideo) {
+                          MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                      } else {
+                          MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                      }
+                      val values = ContentValues().apply {
+                          put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                          put(MediaStore.MediaColumns.MIME_TYPE, if (isVideo) "video/mp4" else "image/jpeg")
+                          put(
+                              MediaStore.MediaColumns.RELATIVE_PATH,
+                              (if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES) + "/FlowSnap"
+                          )
+                          put(MediaStore.MediaColumns.IS_PENDING, 1)
+                      }
+                      val resolver = context.contentResolver
+                      val uri = resolver.insert(collection, values) ?: error("Cannot create file in gallery")
+                      val out = resolver.openOutputStream(uri) ?: error("Cannot open output stream")
+                      Sink(uri, out) { ctx ->
+                          val done = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                          ctx.contentResolver.update(uri, done, null, null)
+                      }
+                  } else {
+                      val dir = File(
+                          Environment.getExternalStoragePublicDirectory(
+                              if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES
+                          ),
+                          "FlowSnap"
+                      )
+                      if (!dir.exists()) dir.mkdirs()
+                      val file = File(dir, fileName)
+                      Sink(Uri.fromFile(file), FileOutputStream(file)) { ctx ->
+                          MediaScannerConnection.scanFile(ctx, arrayOf(file.absolutePath), null, null)
+                      }
+                  }
+              }
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/data/InstagramResolver.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.data
+
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import okhttp3.FormBody
+          import okhttp3.Request
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          /**
+           * Resolves a public Instagram post / reel / IGTV link into direct media URLs.
+           *
+           * Three strategies are tried in order, because Instagram rotates its public
+           * surfaces fairly often:
+           *   1. the `graphql/query` doc_id endpoint used by instagram.com itself
+           *   2. the `/embed/captioned/` page (works for most single posts)
+           *   3. plain OpenGraph meta tags on the post page (thumbnail / video fallback)
+           */
+          object InstagramResolver {
+
+              /** doc_id for PolarisPostActionLoadPostQueryQuery. Update here if it ever rotates. */
+              private const val DOC_ID = "8845758582119845"
+
+              private val STORY_RE = Regex("""instagram\.com/stories/[^/]+/(\d+)""")
+
+              private val SHORTCODE_RE =
+                  Regex("""instagram\.com/(?:[A-Za-z0-9_.]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)""")
+
+              fun extractShortcode(input: String): String? {
+                  val url = input.trim()
+                  SHORTCODE_RE.find(url)?.let { return it.groupValues[1] }
+                  // bare shortcode pasted
+                  if (url.matches(Regex("""^[A-Za-z0-9_-]{8,16}$"""))) return url
+                  return null
+              }
+
+              fun findUrlInText(text: String): String? =
+                  Regex("""https?://\S+""").find(text)?.value?.trimEnd('.', ',', ')')
+
+              suspend fun resolve(rawInput: String): Result<ResolvedPost> = withContext(Dispatchers.IO) {
+                  val input = findUrlInText(rawInput) ?: rawInput.trim()
+                  if (input.contains("/stories/")) {
+                      val storyId = STORY_RE.find(input)?.groupValues?.get(1)
+                      return@withContext when {
+                          Net.sessionId.isBlank() -> Result.failure(
+                              IllegalArgumentException(
+                                  "Stories and Highlights need a logged-in session. Add your Instagram " +
+                                      "sessionid in Settings → Instagram session, then try again."
+                              )
+                          )
+                          storyId == null -> Result.failure(
+                              IllegalArgumentException("Open the story and copy its full link (it must end with the story id).")
+                          )
+                          else -> runCatching { viaPrivateApi(storyId, input) }
+                      }
+                  }
+                  val code = extractShortcode(input)
+                      ?: return@withContext Result.failure(
+                          IllegalArgumentException("That doesn't look like an Instagram post or reel link.")
+                      )
+
+                  runCatching { viaGraphql(code, input) }
+                      .recoverCatching { viaEmbed(code, input) }
+                      .recoverCatching {
+                          if (Net.sessionId.isNotBlank()) viaPrivateApi(mediaIdOf(code), input)
+                          else throw it
+                      }
+                      .recoverCatching { viaOpenGraph(code, input) }
+              }
+
+              // ---------------------------------------------------------------- strategy 1
+
+              private fun viaGraphql(code: String, source: String): ResolvedPost {
+                  val body = FormBody.Builder()
+                      .add("doc_id", DOC_ID)
+                      .add("variables", JSONObject().put("shortcode", code).toString())
+                      .build()
+
+                  val req = Request.Builder()
+                      .url("https://www.instagram.com/graphql/query")
+                      .post(body)
+                      .header("User-Agent", Net.UA)
+                      .header("X-IG-App-ID", Net.IG_APP_ID)
+                      .header("X-Requested-With", "XMLHttpRequest")
+                      .header("Referer", "https://www.instagram.com/p/$code/")
+                      .header("Content-Type", "application/x-www-form-urlencoded")
+                      .apply {
+                          val cookie = Net.cookieHeader()
+                          if (cookie.isNotBlank()) header("Cookie", cookie)
+                      }
+                      .build()
+
+                  Net.client.newCall(req).execute().use { resp ->
+                      val text = resp.body?.string().orEmpty()
+                      if (!resp.isSuccessful || text.isBlank()) error("graphql http ${resp.code}")
+                      val media = JSONObject(text)
+                          .optJSONObject("data")
+                          ?.optJSONObject("xdt_shortcode_media")
+                          ?: error("graphql: no media node")
+                      return parseShortcodeMedia(media, code, source)
+                  }
+              }
+
+              private fun parseShortcodeMedia(node: JSONObject, code: String, source: String): ResolvedPost {
+                  val owner = node.optJSONObject("owner")
+                  val username = owner?.optString("username").orEmpty().ifBlank { "instagram" }
+                  val avatar = owner?.optString("profile_pic_url").orEmpty()
+                  val caption = node.optJSONObject("edge_media_to_caption")
+                      ?.optJSONArray("edges")?.optJSONObject(0)
+                      ?.optJSONObject("node")?.optString("text").orEmpty()
+
+                  val items = mutableListOf<MediaItem>()
+                  val sidecar = node.optJSONObject("edge_sidecar_to_children")?.optJSONArray("edges")
+                  if (sidecar != null && sidecar.length() > 0) {
+                      for (i in 0 until sidecar.length()) {
+                          sidecar.optJSONObject(i)?.optJSONObject("node")?.let { child ->
+                              items += singleNodeToItem(child, "$code-${i + 1}")
+                          }
+                      }
+                  } else {
+                      items += singleNodeToItem(node, code)
+                  }
+
+                  val typename = node.optString("__typename")
+                  return ResolvedPost(
+                      shortcode = code,
+                      username = username,
+                      avatarUrl = avatar,
+                      caption = caption,
+                      isReel = typename.contains("Video") || node.optBoolean("is_video"),
+                      items = items,
+                      sourceUrl = source
+                  )
+              }
+
+              private fun singleNodeToItem(node: JSONObject, id: String): MediaItem {
+                  val isVideo = node.optBoolean("is_video")
+                  val thumb = node.optString("display_url").ifBlank {
+                      node.optJSONArray("display_resources")?.lastObject()?.optString("src").orEmpty()
+                  }
+                  val dims = node.optJSONObject("dimensions")
+                  val w = dims?.optInt("width") ?: 0
+                  val h = dims?.optInt("height") ?: 0
+
+                  val variants = mutableListOf<MediaVariant>()
+                  if (isVideo) {
+                      val main = node.optString("video_url")
+                      if (main.isNotBlank()) {
+                          variants += MediaVariant("Original (Best Quality)", main, w, h)
+                      }
+                      node.optJSONArray("video_resources")?.let { arr ->
+                          for (i in 0 until arr.length()) {
+                              val v = arr.optJSONObject(i) ?: continue
+                              val src = v.optString("src")
+                              val vh = v.optInt("height")
+                              if (src.isNotBlank() && variants.none { it.url == src }) {
+                                  variants += MediaVariant(labelFor(vh), src, v.optInt("width"), vh)
+                              }
+                          }
+                      }
+                  } else {
+                      node.optJSONArray("display_resources")?.let { arr ->
+                          for (i in arr.length() - 1 downTo 0) {
+                              val v = arr.optJSONObject(i) ?: continue
+                              val src = v.optString("src")
+                              val vh = v.optInt("config_height")
+                              if (src.isNotBlank()) {
+                                  val label = if (variants.isEmpty()) "Original (Best Quality)" else labelFor(vh)
+                                  variants += MediaVariant(label, src, v.optInt("config_width"), vh)
+                              }
+                          }
+                      }
+                      if (variants.isEmpty() && thumb.isNotBlank()) {
+                          variants += MediaVariant("Original (Best Quality)", thumb, w, h)
+                      }
+                  }
+
+                  return MediaItem(
+                      id = id,
+                      kind = if (isVideo) MediaKind.VIDEO else MediaKind.PHOTO,
+                      thumbnailUrl = thumb,
+                      variants = variants.distinctBy { it.url },
+                      durationSec = node.optDouble("video_duration", 0.0)
+                  )
+              }
+
+              private fun labelFor(height: Int): String = when {
+                  height >= 1920 -> "1080p (HD)"
+                  height >= 1080 -> "1080p (HD)"
+                  height >= 720 -> "720p (Good)"
+                  height >= 480 -> "480p (Small)"
+                  height > 0 -> "${height}p"
+                  else -> "Alternate"
+              }
+
+              // ---------------------------------------------------------------- strategy 2
+
+              private fun viaEmbed(code: String, source: String): ResolvedPost {
+                  val html = getText("https://www.instagram.com/p/$code/embed/captioned/")
+
+                  // The embed page inlines a JSON blob with the real media node.
+                  val ctx = Regex("""\\"gql_data\\":(\{.*?\})\s*,\\"fbid""", RegexOption.DOT_MATCHES_ALL)
+                      .find(html)?.groupValues?.get(1)
+                  if (ctx != null) {
+                      runCatching {
+                          val json = JSONObject(unescape(ctx))
+                          val node = json.optJSONObject("shortcode_media")
+                          if (node != null) return parseShortcodeMedia(node, code, source)
+                      }
+                  }
+
+                  val videoUrl = Regex(""""video_url":"(.*?)"""").find(html)?.groupValues?.get(1)
+                      ?.let { unescape(it) }
+                  val imageUrl = Regex("""class="EmbeddedMediaImage"[^>]*src="(.*?)"""")
+                      .find(html)?.groupValues?.get(1)?.let { htmlUnescape(it) }
+                      ?: Regex(""""display_url":"(.*?)"""").find(html)?.groupValues?.get(1)?.let { unescape(it) }
+                  val user = Regex("""class="UsernameText">(.*?)<""").find(html)?.groupValues?.get(1).orEmpty()
+
+                  val thumb = imageUrl.orEmpty()
+                  val item = when {
+                      videoUrl != null -> MediaItem(
+                          code, MediaKind.VIDEO, thumb,
+                          listOf(MediaVariant("Original (Best Quality)", videoUrl))
+                      )
+                      thumb.isNotBlank() -> MediaItem(
+                          code, MediaKind.PHOTO, thumb,
+                          listOf(MediaVariant("Original (Best Quality)", thumb))
+                      )
+                      else -> error("embed: nothing found")
+                  }
+                  return ResolvedPost(code, user.ifBlank { "instagram" }, "", "", videoUrl != null, listOf(item), source)
+              }
+
+              // ---------------------------------------------------------------- strategy 3
+
+              private fun viaOpenGraph(code: String, source: String): ResolvedPost {
+                  val html = getText("https://www.instagram.com/p/$code/")
+                  fun meta(prop: String) =
+                      Regex("""<meta[^>]+property=["']$prop["'][^>]+content=["'](.*?)["']""")
+                          .find(html)?.groupValues?.get(1)?.let { htmlUnescape(it) }
+                          ?: Regex("""<meta[^>]+content=["'](.*?)["'][^>]+property=["']$prop["']""")
+                              .find(html)?.groupValues?.get(1)?.let { htmlUnescape(it) }
+
+                  val video = meta("og:video") ?: meta("og:video:secure_url")
+                  val image = meta("og:image")
+                  val title = meta("og:title").orEmpty()
+                  val user = Regex("""@([A-Za-z0-9_.]+)""").find(title)?.groupValues?.get(1) ?: "instagram"
+
+                  val item = when {
+                      !video.isNullOrBlank() -> MediaItem(
+                          code, MediaKind.VIDEO, image.orEmpty(),
+                          listOf(MediaVariant("Original (Best Quality)", video))
+                      )
+                      !image.isNullOrBlank() -> MediaItem(
+                          code, MediaKind.PHOTO, image,
+                          listOf(MediaVariant("Original (Best Quality)", image))
+                      )
+                      else -> error(
+                          "Could not read this post. It may be private, age-restricted, or Instagram " +
+                              "changed its API."
+                      )
+                  }
+                  return ResolvedPost(code, user, "", title, !video.isNullOrBlank(), listOf(item), source)
+              }
+
+              // ------------------------------------------------- strategy 4 (needs cookie)
+
+              /**
+               * `i.instagram.com/api/v1/media/<id>/info/` — the app API. Requires a sessionid
+               * cookie but returns Stories, Highlights and private-but-followed media too.
+               */
+              private fun viaPrivateApi(mediaId: String, source: String): ResolvedPost {
+                  val json = JSONObject(
+                      getText("https://i.instagram.com/api/v1/media/$mediaId/info/", appApi = true)
+                  )
+                  val node = json.optJSONArray("items")?.optJSONObject(0)
+                      ?: error("Media not available for this account.")
+                  val user = node.optJSONObject("user")?.optString("username").orEmpty().ifBlank { "instagram" }
+                  val avatar = node.optJSONObject("user")?.optString("profile_pic_url").orEmpty()
+                  val caption = node.optJSONObject("caption")?.optString("text").orEmpty()
+
+                  val children = node.optJSONArray("carousel_media")
+                  val items = if (children != null && children.length() > 0) {
+                      (0 until children.length()).mapNotNull { i ->
+                          children.optJSONObject(i)?.let { apiNodeToItem(it, "$mediaId-${i + 1}") }
+                      }
+                  } else {
+                      listOf(apiNodeToItem(node, mediaId))
+                  }
+
+                  return ResolvedPost(
+                      shortcode = node.optString("code", mediaId),
+                      username = user,
+                      avatarUrl = avatar,
+                      caption = caption,
+                      isReel = items.any { it.kind == MediaKind.VIDEO },
+                      items = items,
+                      sourceUrl = source
+                  )
+              }
+
+              private fun apiNodeToItem(node: JSONObject, id: String): MediaItem {
+                  val isVideo = node.optInt("media_type") == 2 || node.has("video_versions")
+                  val thumb = node.optJSONObject("image_versions2")
+                      ?.optJSONArray("candidates")?.optJSONObject(0)?.optString("url").orEmpty()
+
+                  val variants = mutableListOf<MediaVariant>()
+                  if (isVideo) {
+                      node.optJSONArray("video_versions")?.let { arr ->
+                          for (i in 0 until arr.length()) {
+                              val v = arr.optJSONObject(i) ?: continue
+                              val h = v.optInt("height")
+                              variants += MediaVariant(
+                                  if (i == 0) "Original (Best Quality)" else labelFor(h),
+                                  v.optString("url"), v.optInt("width"), h
+                              )
+                          }
+                      }
+                  } else {
+                      node.optJSONObject("image_versions2")?.optJSONArray("candidates")?.let { arr ->
+                          for (i in 0 until arr.length()) {
+                              val v = arr.optJSONObject(i) ?: continue
+                              val h = v.optInt("height")
+                              variants += MediaVariant(
+                                  if (i == 0) "Original (Best Quality)" else labelFor(h),
+                                  v.optString("url"), v.optInt("width"), h
+                              )
+                          }
+                      }
+                  }
+                  if (variants.isEmpty() && thumb.isNotBlank()) {
+                      variants += MediaVariant("Original (Best Quality)", thumb)
+                  }
+
+                  return MediaItem(
+                      id = id,
+                      kind = if (isVideo) MediaKind.VIDEO else MediaKind.PHOTO,
+                      thumbnailUrl = thumb,
+                      variants = variants.distinctBy { it.url },
+                      durationSec = node.optDouble("video_duration", 0.0)
+                  )
+              }
+
+              /** Instagram shortcodes are just base64url-encoded media ids. */
+              fun mediaIdOf(shortcode: String): String {
+                  val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                  var id = java.math.BigInteger.ZERO
+                  val sixtyFour = java.math.BigInteger.valueOf(64)
+                  shortcode.takeWhile { alphabet.indexOf(it) >= 0 }.forEach { c ->
+                      id = id.multiply(sixtyFour).add(java.math.BigInteger.valueOf(alphabet.indexOf(c).toLong()))
+                  }
+                  return id.toString()
+              }
+
+              // ---------------------------------------------------------------- helpers
+
+              private fun getText(url: String, appApi: Boolean = false): String {
+                  val req = Request.Builder()
+                      .url(url)
+                      .header("User-Agent", if (appApi) Net.APP_UA else Net.UA)
+                      .header("Accept-Language", "en-US,en;q=0.9")
+                      .header("X-IG-App-ID", Net.IG_APP_ID)
+                      .apply {
+                          val cookie = Net.cookieHeader()
+                          if (cookie.isNotBlank()) header("Cookie", cookie)
+                      }
+                      .build()
+                  Net.client.newCall(req).execute().use { resp ->
+                      val text = resp.body?.string().orEmpty()
+                      if (!resp.isSuccessful) error("http ${resp.code}")
+                      return text
+                  }
+              }
+
+              /** Resolve the real file size with a HEAD request (nice for the quality picker). */
+              suspend fun contentLength(url: String): Long = withContext(Dispatchers.IO) {
+                  runCatching {
+                      val req = Request.Builder().url(url).head()
+                          .header("User-Agent", Net.UA).build()
+                      Net.client.newCall(req).execute().use { it.header("Content-Length")?.toLong() ?: 0L }
+                  }.getOrDefault(0L)
+              }
+
+              private fun unescape(s: String): String =
+                  s.replace("\\\\u0025", "%")
+                      .replace("\\u0025", "%")
+                      .replace("\\\\/", "/")
+                      .replace("\\/", "/")
+                      .replace("\\\\\"", "\"")
+                      .replace("\\\"", "\"")
+                      .replace("\\\\u0026", "&")
+                      .replace("\\u0026", "&")
+
+              private fun htmlUnescape(s: String): String =
+                  s.replace("&amp;", "&").replace("&quot;", "\"").replace("&#039;", "'")
+                      .replace("&lt;", "<").replace("&gt;", ">")
+
+              private fun JSONArray.lastObject(): JSONObject? =
+                  if (length() == 0) null else optJSONObject(length() - 1)
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/data/Models.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.data
+
+          /** One downloadable variant of a media item (e.g. Original / 1080p / 720p). */
+          data class MediaVariant(
+              val label: String,
+              val url: String,
+              val width: Int = 0,
+              val height: Int = 0,
+              val approxBytes: Long = 0L
+          )
+
+          enum class MediaKind { VIDEO, PHOTO }
+
+          /** A single photo or video inside a post (a carousel post has several). */
+          data class MediaItem(
+              val id: String,
+              val kind: MediaKind,
+              val thumbnailUrl: String,
+              val variants: List<MediaVariant>,
+              val durationSec: Double = 0.0
+          ) {
+              val best: MediaVariant? get() = variants.firstOrNull()
+          }
+
+          /** The whole resolved post. */
+          data class ResolvedPost(
+              val shortcode: String,
+              val username: String,
+              val avatarUrl: String,
+              val caption: String,
+              val isReel: Boolean,
+              val items: List<MediaItem>,
+              val sourceUrl: String
+          )
+
+          /** A row in the Downloads screen. */
+          data class DownloadRecord(
+              val id: Long,
+              val fileName: String,
+              val localUri: String,
+              val remoteUrl: String,
+              val thumbnailUrl: String,
+              val kind: MediaKind,
+              val sizeBytes: Long,
+              val createdAt: Long,
+              val username: String = "",
+              val favorite: Boolean = false,
+              val collection: String = ""
+          )
+
+          sealed interface ResolveState {
+              data object Idle : ResolveState
+              data object Loading : ResolveState
+              data class Error(val message: String) : ResolveState
+              data class Success(val post: ResolvedPost) : ResolveState
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/data/Net.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.data
+
+          import okhttp3.OkHttpClient
+          import java.util.concurrent.TimeUnit
+
+          object Net {
+              const val UA =
+                  "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                      "Chrome/122.0.0.0 Mobile Safari/537.36"
+
+              /** User-Agent of the Android app, required by i.instagram.com/api/v1. */
+              const val APP_UA = "Instagram 309.1.0.41.113 Android (33/13; 420dpi; 1080x2176; Google/google; Pixel 7; panther; qcom; en_US)"
+
+              /** Public web app id used by instagram.com itself for anonymous requests. */
+              const val IG_APP_ID = "936619743392459"
+
+              /**
+               * Optional `sessionid` cookie. Empty = fully anonymous (public posts only).
+               * Set from Settings; enables Stories, Highlights and private-but-followed posts.
+               */
+              @Volatile
+              var sessionId: String = ""
+
+              fun cookieHeader(): String =
+                  if (sessionId.isBlank()) "" else "sessionid=${sessionId.trim()};"
+
+              val client: OkHttpClient by lazy {
+                  OkHttpClient.Builder()
+                      .connectTimeout(20, TimeUnit.SECONDS)
+                      .readTimeout(30, TimeUnit.SECONDS)
+                      .followRedirects(true)
+                      .retryOnConnectionFailure(true)
+                      .build()
+              }
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/data/Prefs.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.data
+
+          import android.content.Context
+          import kotlinx.coroutines.flow.MutableStateFlow
+
+          data class Settings(
+              val askBeforeDownloading: Boolean = true,
+              val wifiOnly: Boolean = false,
+              val autoSaveToGallery: Boolean = true,
+              val darkMode: Boolean = true,
+              val theme: String = "Purple",
+              val autoDetectClipboard: Boolean = true,
+              val sessionId: String = ""
+          )
+
+          class Prefs(context: Context) {
+              private val sp = context.getSharedPreferences("flowsnap", Context.MODE_PRIVATE)
+              val state = MutableStateFlow(read())
+
+              init {
+                  Net.sessionId = state.value.sessionId
+              }
+
+              private fun read() = Settings(
+                  askBeforeDownloading = sp.getBoolean("ask", true),
+                  wifiOnly = sp.getBoolean("wifi", false),
+                  autoSaveToGallery = sp.getBoolean("gallery", true),
+                  darkMode = sp.getBoolean("dark", true),
+                  theme = sp.getString("theme", "Purple") ?: "Purple",
+                  autoDetectClipboard = sp.getBoolean("clip", true),
+                  sessionId = sp.getString("sessionid", "") ?: ""
+              )
+
+              fun update(block: (Settings) -> Settings) {
+                  val s = block(state.value)
+                  sp.edit()
+                      .putBoolean("ask", s.askBeforeDownloading)
+                      .putBoolean("wifi", s.wifiOnly)
+                      .putBoolean("gallery", s.autoSaveToGallery)
+                      .putBoolean("dark", s.darkMode)
+                      .putString("theme", s.theme)
+                      .putBoolean("clip", s.autoDetectClipboard)
+                      .putString("sessionid", s.sessionId)
+                      .apply()
+                  state.value = s
+                  Net.sessionId = s.sessionId
+              }
+          }
+          FLOWSNAP_EOF
+
+
+      - name: Write app source (UI layer)
+        working-directory: build-src
+        run: |
+          cat > app/src/main/java/com/flowsnap/app/FlowSnapApp.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app
+
+          import android.app.Application
+
+          class FlowSnapApp : Application()
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/MainActivity.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app
+
+          import android.content.Intent
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Download
+          import androidx.compose.material.icons.filled.Favorite
+          import androidx.compose.material.icons.filled.Home
+          import androidx.compose.material.icons.filled.Settings
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.NavigationBar
+          import androidx.compose.material3.NavigationBarItem
+          import androidx.compose.material3.NavigationBarItemDefaults
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.SnackbarHost
+          import androidx.compose.material3.SnackbarHostState
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.collectAsState
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.remember
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.activity.viewModels
+          import androidx.navigation.NavDestination.Companion.hierarchy
+          import androidx.navigation.NavGraph.Companion.findStartDestination
+          import androidx.navigation.compose.NavHost
+          import androidx.navigation.compose.composable
+          import androidx.navigation.compose.currentBackStackEntryAsState
+          import androidx.navigation.compose.rememberNavController
+          import com.flowsnap.app.data.ResolveState
+          import com.flowsnap.app.ui.MainViewModel
+          import com.flowsnap.app.ui.screens.DownloadsScreen
+          import com.flowsnap.app.ui.screens.FavoritesScreen
+          import com.flowsnap.app.ui.screens.HomeScreen
+          import com.flowsnap.app.ui.screens.PreviewScreen
+          import com.flowsnap.app.ui.screens.SettingsScreen
+          import com.flowsnap.app.ui.screens.StorageScreen
+          import com.flowsnap.app.ui.theme.FlowSnapTheme
+          import com.flowsnap.app.ui.theme.Ink
+          import com.flowsnap.app.ui.theme.InkCard
+          import com.flowsnap.app.ui.theme.NeonPink
+          import com.flowsnap.app.ui.theme.TextLo
+
+          private data class Tab(val route: String, val label: String, val icon: ImageVector)
+
+          private val TABS = listOf(
+              Tab("home", "Home", Icons.Default.Home),
+              Tab("downloads", "Downloads", Icons.Default.Download),
+              Tab("favorites", "Favorites", Icons.Default.Favorite),
+              Tab("settings", "Settings", Icons.Default.Settings)
+          )
+
+          class MainActivity : ComponentActivity() {
+
+              private val vm: MainViewModel by viewModels()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge()
+
+                  setContent {
+                      val settings by vm.prefs.state.collectAsState()
+
+                      val permissionLauncher = rememberLauncher()
+                      LaunchedEffect(Unit) {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                              permissionLauncher("android.permission.POST_NOTIFICATIONS")
+                          } else if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+                              permissionLauncher("android.permission.WRITE_EXTERNAL_STORAGE")
+                          }
+                          vm.handleIntent(intent)
+                      }
+
+                      FlowSnapTheme(darkTheme = settings.darkMode) {
+                          AppRoot(vm)
+                      }
+                  }
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  vm.handleIntent(intent)
+              }
+
+              @Composable
+              private fun rememberLauncher(): (String) -> Unit {
+                  val launcher = androidx.activity.compose.rememberLauncherForActivityResult(
+                      ActivityResultContracts.RequestPermission()
+                  ) { }
+                  return remember { { perm: String -> launcher.launch(perm) } }
+              }
+          }
+
+          @Composable
+          private fun AppRoot(vm: MainViewModel) {
+              val navController = rememberNavController()
+              val backStack by navController.currentBackStackEntryAsState()
+              val currentRoute = backStack?.destination?.route
+              val state by vm.state.collectAsState()
+              val toast by vm.toast.collectAsState()
+              val snackbar = remember { SnackbarHostState() }
+
+              // Jump to the preview screen as soon as a link starts resolving.
+              LaunchedEffect(state) {
+                  if (state is ResolveState.Loading || state is ResolveState.Success || state is ResolveState.Error) {
+                      if (currentRoute != "preview") navController.navigate("preview")
+                  }
+              }
+
+              LaunchedEffect(toast) {
+                  toast?.let {
+                      snackbar.showSnackbar(it)
+                      vm.consumeToast()
+                  }
+              }
+
+              Scaffold(
+                  containerColor = Ink,
+                  snackbarHost = { SnackbarHost(snackbar) },
+                  bottomBar = {
+                      if (currentRoute != "preview" && currentRoute != "storage") {
+                          NavigationBar(containerColor = InkCard) {
+                              TABS.forEach { tab ->
+                                  val selected = backStack?.destination?.hierarchy?.any { it.route == tab.route } == true
+                                  NavigationBarItem(
+                                      selected = selected,
+                                      onClick = {
+                                          navController.navigate(tab.route) {
+                                              popUpTo(navController.graph.findStartDestination().id) { saveState = true }
+                                              launchSingleTop = true
+                                              restoreState = true
+                                          }
+                                      },
+                                      icon = { Icon(tab.icon, contentDescription = tab.label) },
+                                      label = { Text(tab.label, style = MaterialTheme.typography.labelSmall) },
+                                      colors = NavigationBarItemDefaults.colors(
+                                          selectedIconColor = NeonPink,
+                                          selectedTextColor = NeonPink,
+                                          unselectedIconColor = TextLo,
+                                          unselectedTextColor = TextLo,
+                                          indicatorColor = InkCard
+                                      )
+                                  )
+                              }
+                          }
+                      }
+                  }
+              ) { inner ->
+                  Box(
+                      Modifier
+                          .fillMaxSize()
+                          .background(MaterialTheme.colorScheme.background)
+                          .padding(inner)
+                  ) {
+                      NavHost(navController = navController, startDestination = "home") {
+                          composable("home") {
+                              HomeScreen(vm, onOpenDownloads = { navController.navigate("downloads") })
+                          }
+                          composable("preview") {
+                              PreviewScreen(vm, onBack = {
+                                  vm.reset()
+                                  navController.popBackStack()
+                              })
+                          }
+                          composable("downloads") {
+                              DownloadsScreen(vm, onOpenStorage = { navController.navigate("storage") })
+                          }
+                          composable("favorites") { FavoritesScreen(vm) }
+                          composable("settings") {
+                              SettingsScreen(vm, onOpenStorage = { navController.navigate("storage") })
+                          }
+                          composable("storage") {
+                              StorageScreen(vm, onBack = { navController.popBackStack() })
+                          }
+                      }
+                  }
+              }
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/ui/MainViewModel.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.ui
+
+          import android.app.Application
+          import android.content.Intent
+          import androidx.lifecycle.AndroidViewModel
+          import androidx.lifecycle.viewModelScope
+          import com.flowsnap.app.data.DownloadStore
+          import com.flowsnap.app.data.Downloader
+          import com.flowsnap.app.data.InstagramResolver
+          import com.flowsnap.app.data.MediaItem
+          import com.flowsnap.app.data.MediaVariant
+          import com.flowsnap.app.data.Prefs
+          import com.flowsnap.app.data.ResolveState
+          import com.flowsnap.app.data.ResolvedPost
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.launch
+
+          class MainViewModel(app: Application) : AndroidViewModel(app) {
+
+              val store = DownloadStore(app)
+              val prefs = Prefs(app)
+              val downloadProgress = Downloader.progress
+
+              private val _link = MutableStateFlow("")
+              val link: StateFlow<String> = _link
+
+              private val _state = MutableStateFlow<ResolveState>(ResolveState.Idle)
+              val state: StateFlow<ResolveState> = _state
+
+              private val _toast = MutableStateFlow<String?>(null)
+              val toast: StateFlow<String?> = _toast
+
+              /** Index of the carousel item currently shown on the preview screen. */
+              private val _selectedIndex = MutableStateFlow(0)
+              val selectedIndex: StateFlow<Int> = _selectedIndex
+
+              fun setLink(value: String) {
+                  _link.value = value
+              }
+
+              fun selectIndex(i: Int) {
+                  _selectedIndex.value = i
+              }
+
+              fun consumeToast() {
+                  _toast.value = null
+              }
+
+              fun showToast(msg: String) {
+                  _toast.value = msg
+              }
+
+              fun handleIntent(intent: Intent?) {
+                  val text = when (intent?.action) {
+                      Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)
+                      Intent.ACTION_VIEW -> intent.dataString
+                      else -> null
+                  } ?: return
+                  val url = InstagramResolver.findUrlInText(text) ?: text
+                  _link.value = url
+                  resolve(url)
+              }
+
+              fun resolve(input: String = _link.value) {
+                  val value = input.trim()
+                  if (value.isEmpty()) {
+                      _toast.value = "Paste an Instagram link first"
+                      return
+                  }
+                  _selectedIndex.value = 0
+                  _state.value = ResolveState.Loading
+                  viewModelScope.launch {
+                      val result = InstagramResolver.resolve(value)
+                      _state.value = result.fold(
+                          onSuccess = { post ->
+                              if (post.items.isEmpty()) ResolveState.Error("No media found in that post.")
+                              else ResolveState.Success(withSizes(post))
+                          },
+                          onFailure = { ResolveState.Error(it.message ?: "Could not resolve this link.") }
+                      )
+                  }
+              }
+
+              private suspend fun withSizes(post: ResolvedPost): ResolvedPost {
+                  val items = post.items.map { item ->
+                      item.copy(
+                          variants = item.variants.map { v ->
+                              if (v.approxBytes > 0) v
+                              else v.copy(approxBytes = InstagramResolver.contentLength(v.url))
+                          }
+                      )
+                  }
+                  return post.copy(items = items)
+              }
+
+              fun reset() {
+                  _state.value = ResolveState.Idle
+                  _link.value = ""
+              }
+
+              fun download(post: ResolvedPost, item: MediaItem, variant: MediaVariant, index: Int) {
+                  viewModelScope.launch {
+                      val name = Downloader.fileNameFor(post, item, index)
+                      val res = Downloader.download(getApplication(), post, item, variant, name)
+                      res.fold(
+                          onSuccess = {
+                              store.add(it)
+                              _toast.value = "Saved ${it.fileName}"
+                          },
+                          onFailure = { _toast.value = "Download failed: ${it.message}" }
+                      )
+                  }
+              }
+
+              fun downloadAll(post: ResolvedPost) {
+                  viewModelScope.launch {
+                      post.items.forEachIndexed { i, item ->
+                          val v = item.best ?: return@forEachIndexed
+                          val name = Downloader.fileNameFor(post, item, i)
+                          Downloader.download(getApplication(), post, item, v, name)
+                              .onSuccess { store.add(it) }
+                      }
+                      _toast.value = "Saved ${post.items.size} files"
+                  }
+              }
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/ui/components/Common.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.ui.components
+
+          import androidx.compose.foundation.BorderStroke
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.CardDefaults
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.alpha
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import com.flowsnap.app.ui.theme.BrandGradient
+          import com.flowsnap.app.ui.theme.InkCard
+          import com.flowsnap.app.ui.theme.Stroke
+          import java.util.concurrent.TimeUnit
+
+          @Composable
+          fun GradientButton(
+              text: String,
+              modifier: Modifier = Modifier,
+              icon: ImageVector? = null,
+              enabled: Boolean = true,
+              brush: Brush = BrandGradient,
+              onClick: () -> Unit
+          ) {
+              Box(
+                  modifier = modifier
+                      .height(52.dp)
+                      .clip(RoundedCornerShape(16.dp))
+                      .background(brush)
+                      .alpha(if (enabled) 1f else 0.45f)
+                      .clickable(enabled = enabled, onClick = onClick),
+                  contentAlignment = Alignment.Center
+              ) {
+                  Row(
+                      verticalAlignment = Alignment.CenterVertically,
+                      horizontalArrangement = Arrangement.Center
+                  ) {
+                      if (icon != null) {
+                          Icon(icon, contentDescription = null, tint = Color.White)
+                          Spacer(Modifier.width(8.dp))
+                      }
+                      Text(text, color = Color.White, fontWeight = FontWeight.Bold)
+                  }
+              }
+          }
+
+          @Composable
+          fun NeonCard(
+              modifier: Modifier = Modifier,
+              selected: Boolean = false,
+              content: @Composable () -> Unit
+          ) {
+              Card(
+                  modifier = modifier.fillMaxWidth(),
+                  shape = RoundedCornerShape(18.dp),
+                  colors = CardDefaults.cardColors(containerColor = InkCard),
+                  border = BorderStroke(1.dp, if (selected) MaterialTheme.colorScheme.primary else Stroke)
+              ) { content() }
+          }
+
+          @Composable
+          fun SectionTitle(text: String, modifier: Modifier = Modifier) {
+              Text(
+                  text,
+                  modifier = modifier,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  style = MaterialTheme.typography.labelSmall,
+                  fontWeight = FontWeight.SemiBold
+              )
+          }
+
+          fun formatSize(bytes: Long): String = when {
+              bytes <= 0 -> "--"
+              bytes >= 1_073_741_824 -> String.format("%.1f GB", bytes / 1_073_741_824.0)
+              bytes >= 1_048_576 -> String.format("%.1f MB", bytes / 1_048_576.0)
+              else -> String.format("%.0f KB", bytes / 1024.0)
+          }
+
+          fun timeAgo(millis: Long): String {
+              val diff = System.currentTimeMillis() - millis
+              val mins = TimeUnit.MILLISECONDS.toMinutes(diff)
+              val hours = TimeUnit.MILLISECONDS.toHours(diff)
+              val days = TimeUnit.MILLISECONDS.toDays(diff)
+              return when {
+                  mins < 1 -> "just now"
+                  mins < 60 -> "$mins min ago"
+                  hours < 24 -> "$hours hours ago"
+                  days < 2 -> "1 day ago"
+                  else -> "$days days ago"
+              }
+          }
+
+          fun formatDuration(sec: Double): String {
+              val s = sec.toInt()
+              return "%d:%02d".format(s / 60, s % 60)
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/ui/screens/DownloadsScreen.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.ui.screens
+
+          import android.content.Intent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.core.net.toUri
+          import com.flowsnap.app.data.MediaKind
+          import com.flowsnap.app.ui.MainViewModel
+          import com.flowsnap.app.ui.components.*
+          import com.flowsnap.app.ui.theme.*
+
+          private val FILTERS = listOf("All", "Reels", "Photos", "Videos")
+
+          @Composable
+          fun DownloadsScreen(vm: MainViewModel, onOpenStorage: () -> Unit) {
+              val context = LocalContext.current
+              val all by vm.store.items.collectAsState()
+              var filter by remember { mutableStateOf("All") }
+
+              val items = remember(all, filter) {
+                  when (filter) {
+                      "Reels" -> all.filter { it.fileName.startsWith("reels") }
+                      "Photos" -> all.filter { it.kind == MediaKind.PHOTO }
+                      "Videos" -> all.filter { it.kind == MediaKind.VIDEO }
+                      else -> all
+                  }
+              }
+
+              Column(Modifier.fillMaxSize().padding(horizontal = 18.dp)) {
+                  Spacer(Modifier.height(14.dp))
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Text("Downloads", style = MaterialTheme.typography.titleLarge, color = TextHi)
+                      Spacer(Modifier.weight(1f))
+                      IconButton(onClick = onOpenStorage) { Icon(Icons.Default.Settings, null, tint = TextLo) }
+                  }
+                  Spacer(Modifier.height(10.dp))
+                  LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      items(FILTERS) { f ->
+                          val sel = f == filter
+                          Text(
+                              f,
+                              color = if (sel) Color.White else TextLo,
+                              style = MaterialTheme.typography.bodySmall,
+                              modifier = Modifier
+                                  .clip(RoundedCornerShape(50))
+                                  .then(
+                                      if (sel) Modifier.background(BrandGradient)
+                                      else Modifier.background(InkCard)
+                                  )
+                                  .clickable { filter = f }
+                                  .padding(horizontal = 16.dp, vertical = 8.dp)
+                          )
+                      }
+                  }
+                  Spacer(Modifier.height(14.dp))
+
+                  if (items.isEmpty()) {
+                      EmptyState("No downloads yet", "Paste a link on the Home tab to get started.")
+                  } else {
+                      LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                          items(items, key = { it.id }) { rec ->
+                              Box(Modifier.clickable {
+                                  runCatching {
+                                      val intent = Intent(Intent.ACTION_VIEW).apply {
+                                          setDataAndType(
+                                              rec.localUri.toUri(),
+                                              if (rec.kind == MediaKind.VIDEO) "video/*" else "image/*"
+                                          )
+                                          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                      }
+                                      context.startActivity(intent)
+                                  }.onFailure { vm.showToast("Cannot open this file") }
+                              }) { DownloadRow(rec, vm) }
+                          }
+                          item { Spacer(Modifier.height(10.dp)) }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun EmptyState(title: String, subtitle: String) {
+              Column(
+                  Modifier.fillMaxWidth().padding(top = 70.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Icon(Icons.Default.Inbox, null, tint = TextLo, modifier = Modifier.size(44.dp))
+                  Spacer(Modifier.height(10.dp))
+                  Text(title, color = TextHi, fontWeight = FontWeight.SemiBold)
+                  Text(subtitle, color = TextLo, style = MaterialTheme.typography.bodySmall)
+              }
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/ui/screens/FavoritesScreen.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.ui.screens
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Favorite
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import coil.compose.AsyncImage
+          import com.flowsnap.app.ui.MainViewModel
+          import com.flowsnap.app.ui.theme.*
+
+          @Composable
+          fun FavoritesScreen(vm: MainViewModel) {
+              val all by vm.store.items.collectAsState()
+              val favorites = remember(all) { all.filter { it.favorite } }
+
+              Column(Modifier.fillMaxSize().padding(horizontal = 18.dp)) {
+                  Spacer(Modifier.height(14.dp))
+                  Text("Favorites", style = MaterialTheme.typography.titleLarge, color = TextHi)
+                  Spacer(Modifier.height(12.dp))
+
+                  if (favorites.isEmpty()) {
+                      EmptyState("No favorites yet", "Tap the heart on any download to keep it here.")
+                      return@Column
+                  }
+
+                  LazyVerticalGrid(
+                      columns = GridCells.Fixed(2),
+                      horizontalArrangement = Arrangement.spacedBy(12.dp),
+                      verticalArrangement = Arrangement.spacedBy(12.dp)
+                  ) {
+                      items(favorites, key = { it.id }) { rec ->
+                          Box(
+                              Modifier.height(150.dp)
+                                  .clip(RoundedCornerShape(16.dp))
+                                  .background(InkCard)
+                                  .clickable { vm.store.toggleFavorite(rec.id) }
+                          ) {
+                              AsyncImage(
+                                  model = rec.localUri.ifBlank { rec.thumbnailUrl },
+                                  contentDescription = null,
+                                  contentScale = ContentScale.Crop,
+                                  modifier = Modifier.fillMaxSize()
+                              )
+                              Box(
+                                  Modifier.fillMaxSize().background(
+                                      Brush.verticalGradient(
+                                          listOf(Color.Transparent, Color.Black.copy(alpha = .75f))
+                                      )
+                                  )
+                              )
+                              Row(
+                                  Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(10.dp),
+                                  verticalAlignment = Alignment.CenterVertically
+                              ) {
+                                  Column(Modifier.weight(1f)) {
+                                      Text(
+                                          rec.collection.ifBlank { rec.username.ifBlank { "Saved" } },
+                                          color = Color.White,
+                                          fontWeight = FontWeight.SemiBold,
+                                          maxLines = 1
+                                      )
+                                      Text(
+                                          rec.fileName,
+                                          color = Color.White.copy(alpha = .7f),
+                                          style = MaterialTheme.typography.bodySmall,
+                                          maxLines = 1
+                                      )
+                                  }
+                                  Icon(Icons.Default.Favorite, null, tint = NeonPink)
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/ui/screens/HomeScreen.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.ui.screens
+
+          import android.content.ClipboardManager
+          import android.content.Context
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material.icons.outlined.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.ImeAction
+          import androidx.compose.ui.unit.dp
+          import coil.compose.AsyncImage
+          import com.flowsnap.app.data.DownloadRecord
+          import com.flowsnap.app.data.MediaKind
+          import com.flowsnap.app.ui.MainViewModel
+          import com.flowsnap.app.ui.components.*
+          import com.flowsnap.app.ui.theme.*
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun HomeScreen(vm: MainViewModel, onOpenDownloads: () -> Unit) {
+              val context = LocalContext.current
+              val link by vm.link.collectAsState()
+              val downloads by vm.store.items.collectAsState()
+              val settings by vm.prefs.state.collectAsState()
+
+              // Auto-detect an Instagram link sitting in the clipboard.
+              LaunchedEffect(settings.autoDetectClipboard) {
+                  if (!settings.autoDetectClipboard || link.isNotBlank()) return@LaunchedEffect
+                  val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                  val text = cm?.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+                  if (text.contains("instagram.com")) vm.setLink(text.trim())
+              }
+
+              Column(Modifier.fillMaxSize().padding(horizontal = 18.dp)) {
+                  Spacer(Modifier.height(10.dp))
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Box(
+                          Modifier.size(34.dp).clip(RoundedCornerShape(10.dp)).background(BrandGradient),
+                          contentAlignment = Alignment.Center
+                      ) { Icon(Icons.Default.Download, null, tint = Color.White, modifier = Modifier.size(20.dp)) }
+                      Spacer(Modifier.width(10.dp))
+                      Row {
+                          Text("Flow", style = MaterialTheme.typography.titleLarge, color = TextHi)
+                          Text("Snap", style = MaterialTheme.typography.titleLarge, color = NeonPink)
+                      }
+                      Spacer(Modifier.weight(1f))
+                      Icon(Icons.Default.WorkspacePremium, null, tint = Color(0xFFFFC53D))
+                  }
+
+                  Spacer(Modifier.height(18.dp))
+                  OutlinedTextField(
+                      value = link,
+                      onValueChange = vm::setLink,
+                      modifier = Modifier.fillMaxWidth(),
+                      placeholder = { Text("Paste Instagram link here...", color = TextLo) },
+                      leadingIcon = { Icon(Icons.Default.Link, null, tint = NeonPurple) },
+                      trailingIcon = {
+                          if (link.isNotEmpty()) {
+                              IconButton(onClick = { vm.setLink("") }) {
+                                  Icon(Icons.Default.Close, null, tint = TextLo)
+                              }
+                          }
+                      },
+                      singleLine = true,
+                      shape = RoundedCornerShape(16.dp),
+                      keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+                      colors = OutlinedTextFieldDefaults.colors(
+                          focusedContainerColor = InkCard,
+                          unfocusedContainerColor = InkCard,
+                          focusedBorderColor = NeonPurple,
+                          unfocusedBorderColor = Stroke,
+                          focusedTextColor = TextHi,
+                          unfocusedTextColor = TextHi
+                      )
+                  )
+
+                  Spacer(Modifier.height(14.dp))
+                  GradientButton(
+                      text = "Download",
+                      modifier = Modifier.fillMaxWidth(),
+                      icon = Icons.Default.Download,
+                      onClick = { vm.resolve() }
+                  )
+
+                  Spacer(Modifier.height(20.dp))
+                  Row(
+                      Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.SpaceBetween
+                  ) {
+                      QuickTile(Icons.Default.Movie, "Reels")
+                      QuickTile(Icons.Default.Image, "Photos")
+                      QuickTile(Icons.Default.RadioButtonUnchecked, "Stories")
+                      QuickTile(Icons.Default.Videocam, "Videos")
+                  }
+
+                  Spacer(Modifier.height(22.dp))
+                  Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                      Text("Recent Downloads", color = TextHi, fontWeight = FontWeight.SemiBold)
+                      Spacer(Modifier.weight(1f))
+                      Text(
+                          "See all",
+                          color = NeonPurple,
+                          style = MaterialTheme.typography.bodySmall,
+                          modifier = Modifier.clickable { onOpenDownloads() }
+                      )
+                  }
+                  Spacer(Modifier.height(10.dp))
+
+                  if (downloads.isEmpty()) {
+                      NeonCard {
+                          Column(
+                              Modifier.fillMaxWidth().padding(24.dp),
+                              horizontalAlignment = Alignment.CenterHorizontally
+                          ) {
+                              Icon(Icons.Outlined.CloudDownload, null, tint = TextLo, modifier = Modifier.size(34.dp))
+                              Spacer(Modifier.height(8.dp))
+                              Text("Nothing downloaded yet", color = TextLo, style = MaterialTheme.typography.bodySmall)
+                          }
+                      }
+                  } else {
+                      LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                          items(downloads.take(4), key = { it.id }) { DownloadRow(it, vm) }
+                      }
+                  }
+                  Spacer(Modifier.height(16.dp))
+              }
+          }
+
+          @Composable
+          fun QuickTile(icon: ImageVector, label: String) {
+              Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                  Box(
+                      Modifier.size(54.dp)
+                          .clip(RoundedCornerShape(16.dp))
+                          .background(InkCard)
+                          .border(1.dp, Stroke, RoundedCornerShape(16.dp)),
+                      contentAlignment = Alignment.Center
+                  ) { Icon(icon, null, tint = NeonPurple) }
+                  Spacer(Modifier.height(6.dp))
+                  Text(label, color = TextLo, style = MaterialTheme.typography.bodySmall)
+              }
+          }
+
+          @Composable
+          fun DownloadRow(record: DownloadRecord, vm: MainViewModel, onDelete: (() -> Unit)? = null) {
+              NeonCard {
+                  Row(
+                      Modifier.fillMaxWidth().padding(10.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Box(
+                          Modifier.size(52.dp).clip(RoundedCornerShape(12.dp)).background(InkCard2),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          AsyncImage(
+                              model = record.localUri.ifBlank { record.thumbnailUrl },
+                              contentDescription = null,
+                              modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(12.dp)),
+                              contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                          )
+                          if (record.kind == MediaKind.VIDEO) {
+                              Icon(Icons.Default.PlayArrow, null, tint = Color.White.copy(alpha = .9f))
+                          }
+                      }
+                      Spacer(Modifier.width(12.dp))
+                      Column(Modifier.weight(1f)) {
+                          Text(
+                              record.fileName,
+                              color = TextHi,
+                              maxLines = 1,
+                              style = MaterialTheme.typography.bodyMedium
+                          )
+                          Text(
+                              "${formatSize(record.sizeBytes)} • ${timeAgo(record.createdAt)}",
+                              color = TextLo,
+                              style = MaterialTheme.typography.bodySmall
+                          )
+                      }
+                      IconButton(onClick = { vm.store.toggleFavorite(record.id) }) {
+                          Icon(
+                              if (record.favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                              null,
+                              tint = if (record.favorite) NeonPink else TextLo
+                          )
+                      }
+                      IconButton(onClick = { onDelete?.invoke() ?: vm.store.remove(record.id) }) {
+                          Icon(Icons.Default.MoreVert, null, tint = TextLo)
+                      }
+                  }
+              }
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/ui/screens/PreviewScreen.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.ui.screens
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.itemsIndexed
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import coil.compose.AsyncImage
+          import com.flowsnap.app.data.MediaKind
+          import com.flowsnap.app.data.ResolveState
+          import com.flowsnap.app.ui.MainViewModel
+          import com.flowsnap.app.ui.components.*
+          import com.flowsnap.app.ui.theme.*
+
+          @Composable
+          fun PreviewScreen(vm: MainViewModel, onBack: () -> Unit) {
+              val state by vm.state.collectAsState()
+              val index by vm.selectedIndex.collectAsState()
+              val progress by vm.downloadProgress.collectAsState()
+
+              Column(Modifier.fillMaxSize().padding(horizontal = 18.dp).verticalScroll(rememberScrollState())) {
+                  Spacer(Modifier.height(10.dp))
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null, tint = TextHi) }
+                      Text("Preview & Download", color = TextHi, fontWeight = FontWeight.Bold)
+                  }
+                  Spacer(Modifier.height(8.dp))
+
+                  when (val s = state) {
+                      is ResolveState.Loading -> LoadingBlock()
+                      is ResolveState.Error -> ErrorBlock(s.message) { vm.resolve() }
+                      is ResolveState.Success -> {
+                          val post = s.post
+                          val item = post.items.getOrElse(index) { post.items.first() }
+                          var selectedVariant by remember(item.id) { mutableStateOf(item.variants.firstOrNull()) }
+
+                          Box(
+                              Modifier.fillMaxWidth().height(230.dp)
+                                  .clip(RoundedCornerShape(18.dp)).background(InkCard2),
+                              contentAlignment = Alignment.Center
+                          ) {
+                              AsyncImage(
+                                  model = item.thumbnailUrl,
+                                  contentDescription = null,
+                                  modifier = Modifier.fillMaxSize(),
+                                  contentScale = ContentScale.Crop
+                              )
+                              if (item.kind == MediaKind.VIDEO) {
+                                  Box(
+                                      Modifier.size(56.dp).clip(CircleShape)
+                                          .background(Color.Black.copy(alpha = .45f)),
+                                      contentAlignment = Alignment.Center
+                                  ) { Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(32.dp)) }
+                              }
+                              if (item.durationSec > 0) {
+                                  Text(
+                                      formatDuration(item.durationSec),
+                                      color = Color.White,
+                                      style = MaterialTheme.typography.bodySmall,
+                                      modifier = Modifier.align(Alignment.BottomEnd).padding(10.dp)
+                                          .background(Color.Black.copy(alpha = .55f), RoundedCornerShape(6.dp))
+                                          .padding(horizontal = 6.dp, vertical = 2.dp)
+                                  )
+                              }
+                          }
+
+                          if (post.items.size > 1) {
+                              Spacer(Modifier.height(10.dp))
+                              LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                  itemsIndexed(post.items) { i, it ->
+                                      AsyncImage(
+                                          model = it.thumbnailUrl,
+                                          contentDescription = null,
+                                          contentScale = ContentScale.Crop,
+                                          modifier = Modifier.size(58.dp)
+                                              .clip(RoundedCornerShape(10.dp))
+                                              .border(
+                                                  2.dp,
+                                                  if (i == index) NeonPink else Stroke,
+                                                  RoundedCornerShape(10.dp)
+                                              )
+                                              .clickable { vm.selectIndex(i) }
+                                      )
+                                  }
+                              }
+                          }
+
+                          Spacer(Modifier.height(14.dp))
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              AsyncImage(
+                                  model = post.avatarUrl,
+                                  contentDescription = null,
+                                  modifier = Modifier.size(34.dp).clip(CircleShape).background(InkCard2)
+                              )
+                              Spacer(Modifier.width(10.dp))
+                              Column {
+                                  Text("@${post.username}", color = TextHi, style = MaterialTheme.typography.bodyMedium)
+                                  Text(
+                                      buildString {
+                                          append(if (item.kind == MediaKind.VIDEO) "Reel" else "Photo")
+                                          if (item.durationSec > 0) append(" • ${formatDuration(item.durationSec)}")
+                                          selectedVariant?.let { append(" • ${formatSize(it.approxBytes)}") }
+                                      },
+                                      color = TextLo,
+                                      style = MaterialTheme.typography.bodySmall
+                                  )
+                              }
+                          }
+
+                          Spacer(Modifier.height(16.dp))
+                          Text("Download Quality", color = TextHi, fontWeight = FontWeight.SemiBold)
+                          Spacer(Modifier.height(8.dp))
+                          item.variants.forEachIndexed { i, v ->
+                              val selected = v == selectedVariant
+                              NeonCard(
+                                  modifier = Modifier.padding(bottom = 8.dp).clickable { selectedVariant = v },
+                                  selected = selected
+                              ) {
+                                  Row(
+                                      Modifier.fillMaxWidth().padding(14.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      RadioButton(
+                                          selected = selected,
+                                          onClick = { selectedVariant = v },
+                                          colors = RadioButtonDefaults.colors(selectedColor = NeonPurple)
+                                      )
+                                      Spacer(Modifier.width(6.dp))
+                                      Column(Modifier.weight(1f)) {
+                                          Text(v.label, color = TextHi, style = MaterialTheme.typography.bodyMedium)
+                                          if (v.height > 0) {
+                                              Text("${v.width}×${v.height}", color = TextLo, style = MaterialTheme.typography.bodySmall)
+                                          }
+                                      }
+                                      if (i == 0) {
+                                          Text(
+                                              "Recommended",
+                                              color = NeonPink,
+                                              style = MaterialTheme.typography.labelSmall,
+                                              modifier = Modifier
+                                                  .background(NeonPink.copy(alpha = .14f), RoundedCornerShape(8.dp))
+                                                  .padding(horizontal = 8.dp, vertical = 3.dp)
+                                          )
+                                          Spacer(Modifier.width(8.dp))
+                                      }
+                                      Text(formatSize(v.approxBytes), color = TextLo, style = MaterialTheme.typography.bodySmall)
+                                  }
+                              }
+                          }
+
+                          progress?.let { p ->
+                              if (!p.done) {
+                                  LinearProgressIndicator(
+                                      progress = { p.percent / 100f },
+                                      modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                      color = NeonPink,
+                                      trackColor = Stroke
+                                  )
+                                  Text("${p.percent}% • ${p.fileName}", color = TextLo, style = MaterialTheme.typography.bodySmall)
+                              }
+                          }
+
+                          Spacer(Modifier.height(10.dp))
+                          GradientButton(
+                              text = "Download",
+                              modifier = Modifier.fillMaxWidth(),
+                              icon = Icons.Default.Download,
+                              enabled = selectedVariant != null
+                          ) {
+                              selectedVariant?.let { vm.download(post, item, it, index) }
+                          }
+
+                          if (post.items.size > 1) {
+                              Spacer(Modifier.height(10.dp))
+                              OutlinedButton(
+                                  onClick = { vm.downloadAll(post) },
+                                  modifier = Modifier.fillMaxWidth().height(50.dp),
+                                  shape = RoundedCornerShape(16.dp),
+                                  border = androidx.compose.foundation.BorderStroke(1.dp, NeonPurple)
+                              ) { Text("Download all ${post.items.size} items", color = NeonPurple) }
+                          }
+                          Spacer(Modifier.height(24.dp))
+                      }
+                      ResolveState.Idle -> Unit
+                  }
+              }
+          }
+
+          @Composable
+          private fun LoadingBlock() {
+              Column(
+                  Modifier.fillMaxWidth().padding(top = 80.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  CircularProgressIndicator(color = NeonPink)
+                  Spacer(Modifier.height(14.dp))
+                  Text("Fetching media…", color = TextLo)
+              }
+          }
+
+          @Composable
+          private fun ErrorBlock(message: String, onRetry: () -> Unit) {
+              NeonCard(modifier = Modifier.padding(top = 40.dp)) {
+                  Column(Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                      Icon(Icons.Default.ErrorOutline, null, tint = NeonRose, modifier = Modifier.size(38.dp))
+                      Spacer(Modifier.height(10.dp))
+                      Text(message, color = TextLo, style = MaterialTheme.typography.bodySmall)
+                      Spacer(Modifier.height(14.dp))
+                      GradientButton("Try again", Modifier.fillMaxWidth()) { onRetry() }
+                  }
+              }
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/ui/screens/SettingsScreen.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.ui.screens
+
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.compose.ui.unit.dp
+          import com.flowsnap.app.ui.MainViewModel
+          import com.flowsnap.app.ui.components.NeonCard
+          import com.flowsnap.app.ui.components.SectionTitle
+          import com.flowsnap.app.ui.components.formatSize
+          import com.flowsnap.app.ui.theme.*
+
+          @Composable
+          fun SettingsScreen(vm: MainViewModel, onOpenStorage: () -> Unit) {
+              val s by vm.prefs.state.collectAsState()
+              var showSessionDialog by remember { mutableStateOf(false) }
+
+              if (showSessionDialog) {
+                  SessionDialog(
+                      current = s.sessionId,
+                      onDismiss = { showSessionDialog = false },
+                      onSave = { value ->
+                          vm.prefs.update { it.copy(sessionId = value.trim()) }
+                          showSessionDialog = false
+                          vm.showToast(if (value.isBlank()) "Session cleared" else "Session saved")
+                      }
+                  )
+              }
+
+              Column(
+                  Modifier.fillMaxSize().padding(horizontal = 18.dp).verticalScroll(rememberScrollState())
+              ) {
+                  Spacer(Modifier.height(14.dp))
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Icon(Icons.Default.Settings, null, tint = NeonPurple)
+                      Spacer(Modifier.width(8.dp))
+                      Text("Settings", style = MaterialTheme.typography.titleLarge, color = TextHi)
+                  }
+
+                  Spacer(Modifier.height(18.dp))
+                  SectionTitle("DOWNLOADS")
+                  Spacer(Modifier.height(8.dp))
+                  NeonCard {
+                      Column {
+                          NavRow(Icons.Default.Folder, "Storage & clean up", onClick = onOpenStorage)
+                          HorizontalDivider(color = Stroke)
+                          SwitchRow(Icons.Default.HelpOutline, "Ask before downloading", s.askBeforeDownloading) { v ->
+                              vm.prefs.update { it.copy(askBeforeDownloading = v) }
+                          }
+                          HorizontalDivider(color = Stroke)
+                          SwitchRow(Icons.Default.Wifi, "Wi-Fi only", s.wifiOnly) { v ->
+                              vm.prefs.update { it.copy(wifiOnly = v) }
+                          }
+                          HorizontalDivider(color = Stroke)
+                          SwitchRow(Icons.Default.PhotoLibrary, "Auto-save to Gallery", s.autoSaveToGallery) { v ->
+                              vm.prefs.update { it.copy(autoSaveToGallery = v) }
+                          }
+                          HorizontalDivider(color = Stroke)
+                          SwitchRow(Icons.Default.ContentPaste, "Auto-detect clipboard link", s.autoDetectClipboard) { v ->
+                              vm.prefs.update { it.copy(autoDetectClipboard = v) }
+                          }
+                      }
+                  }
+
+                  Spacer(Modifier.height(18.dp))
+                  SectionTitle("APPEARANCE")
+                  Spacer(Modifier.height(8.dp))
+                  NeonCard {
+                      Column {
+                          SwitchRow(Icons.Default.DarkMode, "Dark mode", s.darkMode) { v ->
+                              vm.prefs.update { it.copy(darkMode = v) }
+                          }
+                          HorizontalDivider(color = Stroke)
+                          NavRow(Icons.Default.Palette, "App theme", value = s.theme) {
+                              val next = when (s.theme) {
+                                  "Purple" -> "Pink"
+                                  "Pink" -> "Blue"
+                                  else -> "Purple"
+                              }
+                              vm.prefs.update { it.copy(theme = next) }
+                          }
+                      }
+                  }
+
+                  Spacer(Modifier.height(18.dp))
+                  SectionTitle("ADVANCED")
+                  Spacer(Modifier.height(8.dp))
+                  NeonCard {
+                      Column {
+                          NavRow(
+                              Icons.Default.Key,
+                              "Instagram session",
+                              value = if (s.sessionId.isBlank()) "Not set" else "Connected"
+                          ) { showSessionDialog = true }
+                      }
+                  }
+                  Text(
+                      "Optional. Paste your instagram.com `sessionid` cookie to also download Stories, " +
+                          "Highlights and posts from private accounts you follow. Stored only on this device.",
+                      color = TextLo,
+                      style = MaterialTheme.typography.bodySmall,
+                      modifier = Modifier.padding(top = 6.dp, start = 4.dp, end = 4.dp)
+                  )
+
+                  Spacer(Modifier.height(18.dp))
+                  SectionTitle("ABOUT")
+                  Spacer(Modifier.height(8.dp))
+                  NeonCard {
+                      Column {
+                          NavRow(Icons.Default.Info, "Version", value = "1.0.0") {}
+                          HorizontalDivider(color = Stroke)
+                          NavRow(Icons.Default.Shield, "Only download content you have the right to save") {}
+                      }
+                  }
+                  Spacer(Modifier.height(30.dp))
+              }
+          }
+
+          @Composable
+          fun StorageScreen(vm: MainViewModel, onBack: () -> Unit) {
+              val items by vm.store.items.collectAsState()
+              val used = remember(items) { items.sumOf { it.sizeBytes } }
+              val largest = remember(items) { items.sortedByDescending { it.sizeBytes }.take(5) }
+
+              Column(Modifier.fillMaxSize().padding(horizontal = 18.dp).verticalScroll(rememberScrollState())) {
+                  Spacer(Modifier.height(10.dp))
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null, tint = TextHi) }
+                      Text("Storage", style = MaterialTheme.typography.titleLarge, color = TextHi)
+                  }
+                  Spacer(Modifier.height(16.dp))
+                  NeonCard {
+                      Column(Modifier.padding(18.dp)) {
+                          Text(formatSize(used), color = TextHi, style = MaterialTheme.typography.headlineSmall)
+                          Text("used by FlowSnap · ${items.size} files", color = TextLo,
+                              style = MaterialTheme.typography.bodySmall)
+                          Spacer(Modifier.height(12.dp))
+                          LinearProgressIndicator(
+                              progress = { (used / (2L * 1024 * 1024 * 1024).toFloat()).coerceIn(0f, 1f) },
+                              modifier = Modifier.fillMaxWidth(),
+                              color = NeonPink,
+                              trackColor = Stroke
+                          )
+                      }
+                  }
+
+                  Spacer(Modifier.height(18.dp))
+                  SectionTitle("LARGEST DOWNLOADS")
+                  Spacer(Modifier.height(8.dp))
+                  largest.forEach { rec ->
+                      NeonCard(modifier = Modifier.padding(bottom = 8.dp)) {
+                          Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                              Column(Modifier.weight(1f)) {
+                                  Text(rec.fileName, color = TextHi, maxLines = 1,
+                                      style = MaterialTheme.typography.bodyMedium)
+                                  Text(formatSize(rec.sizeBytes), color = TextLo,
+                                      style = MaterialTheme.typography.bodySmall)
+                              }
+                              IconButton(onClick = { vm.store.remove(rec.id) }) {
+                                  Icon(Icons.Default.Delete, null, tint = NeonRose)
+                              }
+                          }
+                      }
+                  }
+
+                  Spacer(Modifier.height(10.dp))
+                  com.flowsnap.app.ui.components.GradientButton(
+                      text = "Clear download history",
+                      modifier = Modifier.fillMaxWidth(),
+                      icon = Icons.Default.Delete
+                  ) {
+                      vm.store.clearAll()
+                      vm.showToast("History cleared (files stay in your gallery)")
+                  }
+                  Spacer(Modifier.height(30.dp))
+              }
+          }
+
+          @Composable
+          private fun SwitchRow(icon: ImageVector, label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+              Row(
+                  Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Icon(icon, null, tint = NeonPurple, modifier = Modifier.size(20.dp))
+                  Spacer(Modifier.width(12.dp))
+                  Text(label, color = TextHi, modifier = Modifier.weight(1f),
+                      style = MaterialTheme.typography.bodyMedium)
+                  Switch(
+                      checked = checked,
+                      onCheckedChange = onChange,
+                      colors = SwitchDefaults.colors(
+                          checkedThumbColor = androidx.compose.ui.graphics.Color.White,
+                          checkedTrackColor = NeonPurple,
+                          uncheckedTrackColor = Stroke
+                      )
+                  )
+              }
+          }
+
+          @Composable
+          private fun NavRow(icon: ImageVector, label: String, value: String = "", onClick: () -> Unit) {
+              Row(
+                  Modifier.fillMaxWidth()
+                      .clickable(onClick = onClick)
+                      .padding(horizontal = 14.dp, vertical = 16.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Icon(icon, null, tint = NeonPurple, modifier = Modifier.size(20.dp))
+                  Spacer(Modifier.width(12.dp))
+                  Text(label, color = TextHi, modifier = Modifier.weight(1f),
+                      style = MaterialTheme.typography.bodyMedium)
+                  if (value.isNotEmpty()) {
+                      Text(value, color = TextLo, style = MaterialTheme.typography.bodySmall)
+                      Spacer(Modifier.width(6.dp))
+                  }
+                  Icon(Icons.Default.ChevronRight, null, tint = TextLo, modifier = Modifier.size(18.dp))
+              }
+          }
+
+          @Composable
+          private fun SessionDialog(current: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+              var text by remember { mutableStateOf(current) }
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  containerColor = InkCard,
+                  title = { Text("Instagram session", color = TextHi) },
+                  text = {
+                      Column {
+                          Text(
+                              "Log in to instagram.com in a browser, open DevTools → Application → Cookies " +
+                                  "and copy the value of `sessionid`.",
+                              color = TextLo,
+                              style = MaterialTheme.typography.bodySmall
+                          )
+                          Spacer(Modifier.height(12.dp))
+                          OutlinedTextField(
+                              value = text,
+                              onValueChange = { text = it },
+                              placeholder = { Text("sessionid value", color = TextLo) },
+                              singleLine = true,
+                              colors = OutlinedTextFieldDefaults.colors(
+                                  focusedContainerColor = InkCard2,
+                                  unfocusedContainerColor = InkCard2,
+                                  focusedBorderColor = NeonPurple,
+                                  unfocusedBorderColor = Stroke,
+                                  focusedTextColor = TextHi,
+                                  unfocusedTextColor = TextHi
+                              )
+                          )
+                      }
+                  },
+                  confirmButton = { TextButton(onClick = { onSave(text) }) { Text("Save", color = NeonPink) } },
+                  dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = TextLo) } }
+              )
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/ui/theme/Theme.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.ui.theme
+
+          import androidx.compose.foundation.isSystemInDarkTheme
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Typography
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.material3.lightColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.sp
+
+          // --- FlowSnap neon palette -------------------------------------------------
+          val Ink = Color(0xFF0B0718)
+          val InkCard = Color(0xFF15102B)
+          val InkCard2 = Color(0xFF1C1540)
+          val Stroke = Color(0xFF2A2152)
+          val NeonViolet = Color(0xFF7C3AED)
+          val NeonPurple = Color(0xFFA855F7)
+          val NeonPink = Color(0xFFE935C1)
+          val NeonRose = Color(0xFFFB3B6E)
+          val NeonBlue = Color(0xFF4F8CFF)
+          val TextHi = Color(0xFFF2EEFF)
+          val TextLo = Color(0xFF9A92BF)
+
+          val BrandGradient = Brush.horizontalGradient(listOf(NeonViolet, NeonPink, NeonRose))
+          val BrandGradientSoft = Brush.horizontalGradient(listOf(NeonViolet.copy(alpha = .25f), NeonPink.copy(alpha = .25f)))
+
+          private val DarkColors = darkColorScheme(
+              primary = NeonPurple,
+              onPrimary = Color.White,
+              secondary = NeonPink,
+              background = Ink,
+              onBackground = TextHi,
+              surface = InkCard,
+              onSurface = TextHi,
+              surfaceVariant = InkCard2,
+              onSurfaceVariant = TextLo,
+              outline = Stroke,
+              error = NeonRose
+          )
+
+          private val LightColors = lightColorScheme(
+              primary = NeonViolet,
+              secondary = NeonPink,
+              background = Color(0xFFF7F5FF),
+              surface = Color.White,
+              error = NeonRose
+          )
+
+          private val AppTypography = Typography(
+              headlineSmall = TextStyle(fontWeight = FontWeight.Bold, fontSize = 24.sp),
+              titleLarge = TextStyle(fontWeight = FontWeight.Bold, fontSize = 20.sp),
+              titleMedium = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 16.sp),
+              bodyMedium = TextStyle(fontSize = 14.sp),
+              bodySmall = TextStyle(fontSize = 12.sp),
+              labelSmall = TextStyle(fontWeight = FontWeight.Medium, fontSize = 11.sp)
+          )
+
+          @Composable
+          fun FlowSnapTheme(darkTheme: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
+              MaterialTheme(
+                  colorScheme = if (darkTheme) DarkColors else LightColors,
+                  typography = AppTypography,
+                  content = content
+              )
+          }
+          FLOWSNAP_EOF
+
+
+      # ---- optional release signing -------------------------------------
+      # Add repo secrets KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS /
+      # KEY_PASSWORD to sign the release APK with your own key:
+      #   keytool -genkey -v -keystore flowsnap.jks -keyalg RSA -keysize 2048 \
+      #           -validity 10000 -alias flowsnap
+      #   base64 -w0 flowsnap.jks     # paste output into KEYSTORE_BASE64
+      - name: Decode keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        if: env.KEYSTORE_BASE64 != ''
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/flowsnap.jks"
+          {
+            echo "FLOWSNAP_STORE_FILE=$RUNNER_TEMP/flowsnap.jks"
+            echo "FLOWSNAP_STORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}"
+            echo "FLOWSNAP_KEY_ALIAS=${{ secrets.KEY_ALIAS }}"
+            echo "FLOWSNAP_KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}"
+          } >> "$GITHUB_ENV"
+
+      - name: Show generated tree
+        working-directory: build-src
+        run: find . -type f | sort
+
+      - name: Build debug APK
+        working-directory: build-src
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Build release APK
+        working-directory: build-src
+        run: gradle :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APKs
+        run: |
+          mkdir -p artifacts
+          cp build-src/app/build/outputs/apk/debug/app-debug.apk artifacts/FlowSnap-debug.apk
+          cp build-src/app/build/outputs/apk/release/app-release.apk artifacts/FlowSnap-release.apk
+          ls -lh artifacts
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlowSnap-apk
+          path: artifacts/*.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Attach APKs to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.apk
