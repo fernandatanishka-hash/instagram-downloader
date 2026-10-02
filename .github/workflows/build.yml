@@ -593,11 +593,16 @@ jobs:
           /**
            * Resolves a public Instagram post / reel / IGTV link into direct media URLs.
            *
-           * Three strategies are tried in order, because Instagram rotates its public
-           * surfaces fairly often:
-           *   1. the `graphql/query` doc_id endpoint used by instagram.com itself
-           *   2. the `/embed/captioned/` page (works for most single posts)
-           *   3. plain OpenGraph meta tags on the post page (thumbnail / video fallback)
+           * Instagram keeps changing which public surface answers anonymously, so several
+           * strategies are tried in order and the failure reason of each one is kept for
+           * the error message:
+           *
+           *   1. web API      `www.instagram.com/api/v1/media/<id>/info/`
+           *   2. GraphQL POST `www.instagram.com/graphql/query` (doc_id)
+           *   3. GraphQL GET  same query as a plain GET
+           *   4. embed page   `www.instagram.com/p/<code>/embed/captioned/`
+           *   5. OpenGraph    meta tags on the post page
+           *   6. app API      `i.instagram.com/api/v1/media/<id>/info/` (only with a sessionid)
            */
           object InstagramResolver {
 
@@ -605,14 +610,12 @@ jobs:
               private const val DOC_ID = "8845758582119845"
 
               private val STORY_RE = Regex("""instagram\.com/stories/[^/]+/(\d+)""")
-
               private val SHORTCODE_RE =
-                  Regex("""instagram\.com/(?:[A-Za-z0-9_.]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)""")
+                  Regex("""instagram\.com/(?:[A-Za-z0-9_.]+/)?(?:p|reel|reels|tv|share)/([A-Za-z0-9_-]+)""")
 
               fun extractShortcode(input: String): String? {
                   val url = input.trim()
                   SHORTCODE_RE.find(url)?.let { return it.groupValues[1] }
-                  // bare shortcode pasted
                   if (url.matches(Regex("""^[A-Za-z0-9_-]{8,16}$"""))) return url
                   return null
               }
@@ -621,7 +624,13 @@ jobs:
                   Regex("""https?://\S+""").find(text)?.value?.trimEnd('.', ',', ')')
 
               suspend fun resolve(rawInput: String): Result<ResolvedPost> = withContext(Dispatchers.IO) {
-                  val input = findUrlInText(rawInput) ?: rawInput.trim()
+                  var input = findUrlInText(rawInput) ?: rawInput.trim()
+
+                  // share links (instagram.com/share/XXXX) redirect to the real post
+                  if (input.contains("/share/")) {
+                      input = runCatching { finalUrlOf(input) }.getOrDefault(input)
+                  }
+
                   if (input.contains("/stories/")) {
                       val storyId = STORY_RE.find(input)?.groupValues?.get(1)
                       return@withContext when {
@@ -634,60 +643,160 @@ jobs:
                           storyId == null -> Result.failure(
                               IllegalArgumentException("Open the story and copy its full link (it must end with the story id).")
                           )
-                          else -> runCatching { viaPrivateApi(storyId, input) }
+                          else -> runCatching { viaAppApi(storyId, input) }
                       }
                   }
+
                   val code = extractShortcode(input)
                       ?: return@withContext Result.failure(
                           IllegalArgumentException("That doesn't look like an Instagram post or reel link.")
                       )
+                  val mediaId = mediaIdOf(code)
 
-                  runCatching { viaGraphql(code, input) }
-                      .recoverCatching { viaEmbed(code, input) }
-                      .recoverCatching {
-                          if (Net.sessionId.isNotBlank()) viaPrivateApi(mediaIdOf(code), input)
-                          else throw it
+                  val attempts = buildList<Pair<String, () -> ResolvedPost>> {
+                      add("web-api" to { viaWebApi(mediaId, input) })
+                      add("graphql" to { viaGraphqlPost(code, input) })
+                      add("graphql-get" to { viaGraphqlGet(code, input) })
+                      add("embed" to { viaEmbed(code, input) })
+                      add("opengraph" to { viaOpenGraph(code, input) })
+                      if (Net.sessionId.isNotBlank()) add("app-api" to { viaAppApi(mediaId, input) })
+                  }
+
+                  val reasons = mutableListOf<String>()
+                  for ((name, run) in attempts) {
+                      val r = runCatching { run() }
+                      r.getOrNull()?.let { post ->
+                          if (post.items.isNotEmpty() && post.items.any { it.variants.isNotEmpty() }) {
+                              return@withContext Result.success(post)
+                          }
                       }
-                      .recoverCatching { viaOpenGraph(code, input) }
+                      reasons += "$name: ${r.exceptionOrNull()?.message?.take(60) ?: "empty"}"
+                  }
+
+                  Result.failure(
+                      IllegalStateException(
+                          "Instagram refused every public endpoint for this link.\n\n" +
+                              (if (Net.sessionId.isBlank())
+                                  "Fix: open Settings → Instagram session and paste your sessionid cookie — " +
+                                      "that makes downloads work again for posts, reels and stories.\n\n"
+                              else
+                                  "Your saved session may have expired — log in again and paste a fresh " +
+                                      "sessionid in Settings.\n\n") +
+                              "Details — " + reasons.joinToString(" · ")
+                      )
+                  )
               }
 
-              // ---------------------------------------------------------------- strategy 1
+              // ------------------------------------------------------------ strategy 1/6
 
-              private fun viaGraphql(code: String, source: String): ResolvedPost {
-                  val body = FormBody.Builder()
+              private fun viaWebApi(mediaId: String, source: String): ResolvedPost {
+                  val body = getText(
+                      "https://www.instagram.com/api/v1/media/$mediaId/info/",
+                      referer = source
+                  )
+                  return parseApiPayload(body, mediaId, source)
+              }
+
+              private fun viaAppApi(mediaId: String, source: String): ResolvedPost {
+                  val body = getText(
+                      "https://i.instagram.com/api/v1/media/$mediaId/info/",
+                      referer = source,
+                      appUa = true
+                  )
+                  return parseApiPayload(body, mediaId, source)
+              }
+
+              private fun parseApiPayload(body: String, mediaId: String, source: String): ResolvedPost {
+                  val node = JSONObject(body).optJSONArray("items")?.optJSONObject(0)
+                      ?: error("no items")
+                  val user = node.optJSONObject("user")
+                  val children = node.optJSONArray("carousel_media")
+                  val items = if (children != null && children.length() > 0) {
+                      (0 until children.length()).mapNotNull { i ->
+                          children.optJSONObject(i)?.let { apiNodeToItem(it, "$mediaId-${i + 1}") }
+                      }
+                  } else {
+                      listOf(apiNodeToItem(node, mediaId))
+                  }
+                  return ResolvedPost(
+                      shortcode = node.optString("code", mediaId),
+                      username = user?.optString("username").orEmpty().ifBlank { "instagram" },
+                      avatarUrl = user?.optString("profile_pic_url").orEmpty(),
+                      caption = node.optJSONObject("caption")?.optString("text").orEmpty(),
+                      isReel = items.any { it.kind == MediaKind.VIDEO },
+                      items = items,
+                      sourceUrl = source
+                  )
+              }
+
+              private fun apiNodeToItem(node: JSONObject, id: String): MediaItem {
+                  val isVideo = node.optInt("media_type") == 2 || node.has("video_versions")
+                  val thumb = node.optJSONObject("image_versions2")
+                      ?.optJSONArray("candidates")?.optJSONObject(0)?.optString("url").orEmpty()
+
+                  val variants = mutableListOf<MediaVariant>()
+                  val arr = if (isVideo) node.optJSONArray("video_versions")
+                  else node.optJSONObject("image_versions2")?.optJSONArray("candidates")
+                  if (arr != null) {
+                      for (i in 0 until arr.length()) {
+                          val v = arr.optJSONObject(i) ?: continue
+                          val url = v.optString("url")
+                          if (url.isBlank()) continue
+                          val h = v.optInt("height")
+                          variants += MediaVariant(
+                              if (variants.isEmpty()) "Original (Best Quality)" else labelFor(h),
+                              url, v.optInt("width"), h
+                          )
+                      }
+                  }
+                  if (variants.isEmpty() && thumb.isNotBlank()) {
+                      variants += MediaVariant("Original (Best Quality)", thumb)
+                  }
+
+                  return MediaItem(
+                      id = id,
+                      kind = if (isVideo) MediaKind.VIDEO else MediaKind.PHOTO,
+                      thumbnailUrl = thumb,
+                      variants = variants.distinctBy { it.url },
+                      durationSec = node.optDouble("video_duration", 0.0)
+                  )
+              }
+
+              // ------------------------------------------------------------ strategy 2/3
+
+              private fun viaGraphqlPost(code: String, source: String): ResolvedPost {
+                  val form = FormBody.Builder()
                       .add("doc_id", DOC_ID)
                       .add("variables", JSONObject().put("shortcode", code).toString())
                       .build()
-
-                  val req = Request.Builder()
-                      .url("https://www.instagram.com/graphql/query")
-                      .post(body)
-                      .header("User-Agent", Net.UA)
-                      .header("X-IG-App-ID", Net.IG_APP_ID)
-                      .header("X-Requested-With", "XMLHttpRequest")
-                      .header("Referer", "https://www.instagram.com/p/$code/")
+                  val req = baseRequest(
+                      "https://www.instagram.com/graphql/query",
+                      referer = "https://www.instagram.com/p/$code/"
+                  ).post(form)
                       .header("Content-Type", "application/x-www-form-urlencoded")
-                      .apply {
-                          val cookie = Net.cookieHeader()
-                          if (cookie.isNotBlank()) header("Cookie", cookie)
-                      }
+                      .header("Origin", "https://www.instagram.com")
                       .build()
-
-                  Net.client.newCall(req).execute().use { resp ->
-                      val text = resp.body?.string().orEmpty()
-                      if (!resp.isSuccessful || text.isBlank()) error("graphql http ${resp.code}")
-                      val media = JSONObject(text)
-                          .optJSONObject("data")
-                          ?.optJSONObject("xdt_shortcode_media")
-                          ?: error("graphql: no media node")
-                      return parseShortcodeMedia(media, code, source)
-                  }
+                  return parseShortcodeMedia(graphqlMedia(execute(req)), code, source)
               }
+
+              private fun viaGraphqlGet(code: String, source: String): ResolvedPost {
+                  val vars = java.net.URLEncoder.encode(
+                      JSONObject().put("shortcode", code).toString(), "UTF-8"
+                  )
+                  val body = getText(
+                      "https://www.instagram.com/graphql/query/?doc_id=$DOC_ID&variables=$vars",
+                      referer = "https://www.instagram.com/p/$code/"
+                  )
+                  return parseShortcodeMedia(graphqlMedia(body), code, source)
+              }
+
+              private fun graphqlMedia(text: String): JSONObject =
+                  JSONObject(text).optJSONObject("data")
+                      ?.let { it.optJSONObject("xdt_shortcode_media") ?: it.optJSONObject("shortcode_media") }
+                      ?: error("login wall")
 
               private fun parseShortcodeMedia(node: JSONObject, code: String, source: String): ResolvedPost {
                   val owner = node.optJSONObject("owner")
-                  val username = owner?.optString("username").orEmpty().ifBlank { "instagram" }
-                  val avatar = owner?.optString("profile_pic_url").orEmpty()
                   val caption = node.optJSONObject("edge_media_to_caption")
                       ?.optJSONArray("edges")?.optJSONObject(0)
                       ?.optJSONObject("node")?.optString("text").orEmpty()
@@ -697,47 +806,46 @@ jobs:
                   if (sidecar != null && sidecar.length() > 0) {
                       for (i in 0 until sidecar.length()) {
                           sidecar.optJSONObject(i)?.optJSONObject("node")?.let { child ->
-                              items += singleNodeToItem(child, "$code-${i + 1}")
+                              items += gqlNodeToItem(child, "$code-${i + 1}")
                           }
                       }
                   } else {
-                      items += singleNodeToItem(node, code)
+                      items += gqlNodeToItem(node, code)
                   }
 
-                  val typename = node.optString("__typename")
                   return ResolvedPost(
                       shortcode = code,
-                      username = username,
-                      avatarUrl = avatar,
+                      username = owner?.optString("username").orEmpty().ifBlank { "instagram" },
+                      avatarUrl = owner?.optString("profile_pic_url").orEmpty(),
                       caption = caption,
-                      isReel = typename.contains("Video") || node.optBoolean("is_video"),
+                      isReel = node.optBoolean("is_video"),
                       items = items,
                       sourceUrl = source
                   )
               }
 
-              private fun singleNodeToItem(node: JSONObject, id: String): MediaItem {
+              private fun gqlNodeToItem(node: JSONObject, id: String): MediaItem {
                   val isVideo = node.optBoolean("is_video")
                   val thumb = node.optString("display_url").ifBlank {
                       node.optJSONArray("display_resources")?.lastObject()?.optString("src").orEmpty()
                   }
                   val dims = node.optJSONObject("dimensions")
-                  val w = dims?.optInt("width") ?: 0
-                  val h = dims?.optInt("height") ?: 0
-
                   val variants = mutableListOf<MediaVariant>()
+
                   if (isVideo) {
-                      val main = node.optString("video_url")
-                      if (main.isNotBlank()) {
-                          variants += MediaVariant("Original (Best Quality)", main, w, h)
+                      node.optString("video_url").takeIf { it.isNotBlank() }?.let {
+                          variants += MediaVariant(
+                              "Original (Best Quality)", it,
+                              dims?.optInt("width") ?: 0, dims?.optInt("height") ?: 0
+                          )
                       }
                       node.optJSONArray("video_resources")?.let { arr ->
                           for (i in 0 until arr.length()) {
                               val v = arr.optJSONObject(i) ?: continue
                               val src = v.optString("src")
-                              val vh = v.optInt("height")
                               if (src.isNotBlank() && variants.none { it.url == src }) {
-                                  variants += MediaVariant(labelFor(vh), src, v.optInt("width"), vh)
+                                  variants += MediaVariant(labelFor(v.optInt("height")), src,
+                                      v.optInt("width"), v.optInt("height"))
                               }
                           }
                       }
@@ -746,15 +854,16 @@ jobs:
                           for (i in arr.length() - 1 downTo 0) {
                               val v = arr.optJSONObject(i) ?: continue
                               val src = v.optString("src")
-                              val vh = v.optInt("config_height")
-                              if (src.isNotBlank()) {
-                                  val label = if (variants.isEmpty()) "Original (Best Quality)" else labelFor(vh)
-                                  variants += MediaVariant(label, src, v.optInt("config_width"), vh)
-                              }
+                              if (src.isBlank()) continue
+                              val h = v.optInt("config_height")
+                              variants += MediaVariant(
+                                  if (variants.isEmpty()) "Original (Best Quality)" else labelFor(h),
+                                  src, v.optInt("config_width"), h
+                              )
                           }
                       }
                       if (variants.isEmpty() && thumb.isNotBlank()) {
-                          variants += MediaVariant("Original (Best Quality)", thumb, w, h)
+                          variants += MediaVariant("Original (Best Quality)", thumb)
                       }
                   }
 
@@ -767,57 +876,45 @@ jobs:
                   )
               }
 
-              private fun labelFor(height: Int): String = when {
-                  height >= 1920 -> "1080p (HD)"
-                  height >= 1080 -> "1080p (HD)"
-                  height >= 720 -> "720p (Good)"
-                  height >= 480 -> "480p (Small)"
-                  height > 0 -> "${height}p"
-                  else -> "Alternate"
-              }
-
-              // ---------------------------------------------------------------- strategy 2
+              // -------------------------------------------------------------- strategy 4
 
               private fun viaEmbed(code: String, source: String): ResolvedPost {
-                  val html = getText("https://www.instagram.com/p/$code/embed/captioned/")
+                  val html = getText(
+                      "https://www.instagram.com/p/$code/embed/captioned/",
+                      referer = "https://www.instagram.com/"
+                  )
 
-                  // The embed page inlines a JSON blob with the real media node.
-                  val ctx = Regex("""\\"gql_data\\":(\{.*?\})\s*,\\"fbid""", RegexOption.DOT_MATCHES_ALL)
-                      .find(html)?.groupValues?.get(1)
-                  if (ctx != null) {
-                      runCatching {
-                          val json = JSONObject(unescape(ctx))
-                          val node = json.optJSONObject("shortcode_media")
-                          if (node != null) return parseShortcodeMedia(node, code, source)
+                  Regex("""\\"gql_data\\":(\{.*?\})\s*,\\"fbid""", RegexOption.DOT_MATCHES_ALL)
+                      .find(html)?.groupValues?.get(1)?.let { blob ->
+                          runCatching {
+                              JSONObject(unescape(blob)).optJSONObject("shortcode_media")
+                          }.getOrNull()?.let { return parseShortcodeMedia(it, code, source) }
                       }
-                  }
 
-                  val videoUrl = Regex(""""video_url":"(.*?)"""").find(html)?.groupValues?.get(1)
-                      ?.let { unescape(it) }
+                  val videoUrl = Regex(""""video_url":"(.*?)"""").find(html)?.groupValues?.get(1)?.let { unescape(it) }
                   val imageUrl = Regex("""class="EmbeddedMediaImage"[^>]*src="(.*?)"""")
                       .find(html)?.groupValues?.get(1)?.let { htmlUnescape(it) }
                       ?: Regex(""""display_url":"(.*?)"""").find(html)?.groupValues?.get(1)?.let { unescape(it) }
                   val user = Regex("""class="UsernameText">(.*?)<""").find(html)?.groupValues?.get(1).orEmpty()
 
-                  val thumb = imageUrl.orEmpty()
                   val item = when {
                       videoUrl != null -> MediaItem(
-                          code, MediaKind.VIDEO, thumb,
+                          code, MediaKind.VIDEO, imageUrl.orEmpty(),
                           listOf(MediaVariant("Original (Best Quality)", videoUrl))
                       )
-                      thumb.isNotBlank() -> MediaItem(
-                          code, MediaKind.PHOTO, thumb,
-                          listOf(MediaVariant("Original (Best Quality)", thumb))
+                      !imageUrl.isNullOrBlank() -> MediaItem(
+                          code, MediaKind.PHOTO, imageUrl,
+                          listOf(MediaVariant("Original (Best Quality)", imageUrl))
                       )
-                      else -> error("embed: nothing found")
+                      else -> error("no media in embed")
                   }
                   return ResolvedPost(code, user.ifBlank { "instagram" }, "", "", videoUrl != null, listOf(item), source)
               }
 
-              // ---------------------------------------------------------------- strategy 3
+              // -------------------------------------------------------------- strategy 5
 
               private fun viaOpenGraph(code: String, source: String): ResolvedPost {
-                  val html = getText("https://www.instagram.com/p/$code/")
+                  val html = getText("https://www.instagram.com/p/$code/", referer = "https://www.google.com/")
                   fun meta(prop: String) =
                       Regex("""<meta[^>]+property=["']$prop["'][^>]+content=["'](.*?)["']""")
                           .find(html)?.groupValues?.get(1)?.let { htmlUnescape(it) }
@@ -838,141 +935,84 @@ jobs:
                           code, MediaKind.PHOTO, image,
                           listOf(MediaVariant("Original (Best Quality)", image))
                       )
-                      else -> error(
-                          "Could not read this post. It may be private, age-restricted, or Instagram " +
-                              "changed its API."
-                      )
+                      else -> error("no og tags (login wall)")
                   }
                   return ResolvedPost(code, user, "", title, !video.isNullOrBlank(), listOf(item), source)
               }
 
-              // ------------------------------------------------- strategy 4 (needs cookie)
+              // ------------------------------------------------------------------ http
 
-              /**
-               * `i.instagram.com/api/v1/media/<id>/info/` — the app API. Requires a sessionid
-               * cookie but returns Stories, Highlights and private-but-followed media too.
-               */
-              private fun viaPrivateApi(mediaId: String, source: String): ResolvedPost {
-                  val json = JSONObject(
-                      getText("https://i.instagram.com/api/v1/media/$mediaId/info/", appApi = true)
-                  )
-                  val node = json.optJSONArray("items")?.optJSONObject(0)
-                      ?: error("Media not available for this account.")
-                  val user = node.optJSONObject("user")?.optString("username").orEmpty().ifBlank { "instagram" }
-                  val avatar = node.optJSONObject("user")?.optString("profile_pic_url").orEmpty()
-                  val caption = node.optJSONObject("caption")?.optString("text").orEmpty()
-
-                  val children = node.optJSONArray("carousel_media")
-                  val items = if (children != null && children.length() > 0) {
-                      (0 until children.length()).mapNotNull { i ->
-                          children.optJSONObject(i)?.let { apiNodeToItem(it, "$mediaId-${i + 1}") }
-                      }
-                  } else {
-                      listOf(apiNodeToItem(node, mediaId))
-                  }
-
-                  return ResolvedPost(
-                      shortcode = node.optString("code", mediaId),
-                      username = user,
-                      avatarUrl = avatar,
-                      caption = caption,
-                      isReel = items.any { it.kind == MediaKind.VIDEO },
-                      items = items,
-                      sourceUrl = source
-                  )
+              private fun baseRequest(url: String, referer: String, appUa: Boolean = false): Request.Builder {
+                  val b = Request.Builder()
+                      .url(url)
+                      .header("User-Agent", if (appUa) Net.APP_UA else Net.UA)
+                      .header("Accept", "*/*")
+                      .header("Accept-Language", "en-US,en;q=0.9")
+                      .header("X-IG-App-ID", Net.IG_APP_ID)
+                      .header("X-ASBD-ID", "129477")
+                      .header("X-IG-WWW-Claim", "0")
+                      .header("X-Requested-With", "XMLHttpRequest")
+                      .header("Sec-Fetch-Site", "same-origin")
+                      .header("Sec-Fetch-Mode", "cors")
+                      .header("Referer", referer)
+                  val cookie = Net.cookieHeader()
+                  if (cookie.isNotBlank()) b.header("Cookie", cookie)
+                  return b
               }
 
-              private fun apiNodeToItem(node: JSONObject, id: String): MediaItem {
-                  val isVideo = node.optInt("media_type") == 2 || node.has("video_versions")
-                  val thumb = node.optJSONObject("image_versions2")
-                      ?.optJSONArray("candidates")?.optJSONObject(0)?.optString("url").orEmpty()
-
-                  val variants = mutableListOf<MediaVariant>()
-                  if (isVideo) {
-                      node.optJSONArray("video_versions")?.let { arr ->
-                          for (i in 0 until arr.length()) {
-                              val v = arr.optJSONObject(i) ?: continue
-                              val h = v.optInt("height")
-                              variants += MediaVariant(
-                                  if (i == 0) "Original (Best Quality)" else labelFor(h),
-                                  v.optString("url"), v.optInt("width"), h
-                              )
-                          }
-                      }
-                  } else {
-                      node.optJSONObject("image_versions2")?.optJSONArray("candidates")?.let { arr ->
-                          for (i in 0 until arr.length()) {
-                              val v = arr.optJSONObject(i) ?: continue
-                              val h = v.optInt("height")
-                              variants += MediaVariant(
-                                  if (i == 0) "Original (Best Quality)" else labelFor(h),
-                                  v.optString("url"), v.optInt("width"), h
-                              )
-                          }
-                      }
+              private fun execute(req: Request): String {
+                  Net.client.newCall(req).execute().use { resp ->
+                      val text = resp.body?.string().orEmpty()
+                      if (!resp.isSuccessful) error("HTTP ${resp.code}")
+                      if (text.isBlank()) error("empty body")
+                      return text
                   }
-                  if (variants.isEmpty() && thumb.isNotBlank()) {
-                      variants += MediaVariant("Original (Best Quality)", thumb)
-                  }
-
-                  return MediaItem(
-                      id = id,
-                      kind = if (isVideo) MediaKind.VIDEO else MediaKind.PHOTO,
-                      thumbnailUrl = thumb,
-                      variants = variants.distinctBy { it.url },
-                      durationSec = node.optDouble("video_duration", 0.0)
-                  )
               }
+
+              private fun getText(url: String, referer: String = "https://www.instagram.com/", appUa: Boolean = false): String =
+                  execute(baseRequest(url, referer, appUa).get().build())
+
+              private fun finalUrlOf(url: String): String {
+                  Net.client.newCall(baseRequest(url, "https://www.instagram.com/").get().build())
+                      .execute().use { return it.request.url.toString() }
+              }
+
+              /** Resolve the real file size with a HEAD request (for the quality picker). */
+              suspend fun contentLength(url: String): Long = withContext(Dispatchers.IO) {
+                  runCatching {
+                      val req = Request.Builder().url(url).head()
+                          .header("User-Agent", Net.UA)
+                          .header("Referer", "https://www.instagram.com/")
+                          .build()
+                      Net.client.newCall(req).execute().use { it.header("Content-Length")?.toLong() ?: 0L }
+                  }.getOrDefault(0L)
+              }
+
+              // --------------------------------------------------------------- helpers
 
               /** Instagram shortcodes are just base64url-encoded media ids. */
               fun mediaIdOf(shortcode: String): String {
                   val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
                   var id = java.math.BigInteger.ZERO
-                  val sixtyFour = java.math.BigInteger.valueOf(64)
+                  val base = java.math.BigInteger.valueOf(64)
                   shortcode.takeWhile { alphabet.indexOf(it) >= 0 }.forEach { c ->
-                      id = id.multiply(sixtyFour).add(java.math.BigInteger.valueOf(alphabet.indexOf(c).toLong()))
+                      id = id.multiply(base).add(java.math.BigInteger.valueOf(alphabet.indexOf(c).toLong()))
                   }
                   return id.toString()
               }
 
-              // ---------------------------------------------------------------- helpers
-
-              private fun getText(url: String, appApi: Boolean = false): String {
-                  val req = Request.Builder()
-                      .url(url)
-                      .header("User-Agent", if (appApi) Net.APP_UA else Net.UA)
-                      .header("Accept-Language", "en-US,en;q=0.9")
-                      .header("X-IG-App-ID", Net.IG_APP_ID)
-                      .apply {
-                          val cookie = Net.cookieHeader()
-                          if (cookie.isNotBlank()) header("Cookie", cookie)
-                      }
-                      .build()
-                  Net.client.newCall(req).execute().use { resp ->
-                      val text = resp.body?.string().orEmpty()
-                      if (!resp.isSuccessful) error("http ${resp.code}")
-                      return text
-                  }
-              }
-
-              /** Resolve the real file size with a HEAD request (nice for the quality picker). */
-              suspend fun contentLength(url: String): Long = withContext(Dispatchers.IO) {
-                  runCatching {
-                      val req = Request.Builder().url(url).head()
-                          .header("User-Agent", Net.UA).build()
-                      Net.client.newCall(req).execute().use { it.header("Content-Length")?.toLong() ?: 0L }
-                  }.getOrDefault(0L)
+              private fun labelFor(height: Int): String = when {
+                  height >= 1080 -> "1080p (HD)"
+                  height >= 720 -> "720p (Good)"
+                  height >= 480 -> "480p (Small)"
+                  height > 0 -> "${height}p"
+                  else -> "Alternate"
               }
 
               private fun unescape(s: String): String =
-                  s.replace("\\\\u0025", "%")
-                      .replace("\\u0025", "%")
-                      .replace("\\\\/", "/")
-                      .replace("\\/", "/")
-                      .replace("\\\\\"", "\"")
-                      .replace("\\\"", "\"")
-                      .replace("\\\\u0026", "&")
-                      .replace("\\u0026", "&")
+                  s.replace("\\\\u0026", "&").replace("\\u0026", "&")
+                      .replace("\\\\/", "/").replace("\\/", "/")
+                      .replace("\\\\\"", "\"").replace("\\\"", "\"")
 
               private fun htmlUnescape(s: String): String =
                   s.replace("&amp;", "&").replace("&quot;", "\"").replace("&#039;", "'")
@@ -1049,9 +1089,10 @@ jobs:
           import java.util.concurrent.TimeUnit
 
           object Net {
+              /** Desktop Chrome UA — the web endpoints answer anonymously far more often with it. */
               const val UA =
-                  "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) " +
-                      "Chrome/122.0.0.0 Mobile Safari/537.36"
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                      "Chrome/129.0.0.0 Safari/537.36"
 
               /** User-Agent of the Android app, required by i.instagram.com/api/v1. */
               const val APP_UA = "Instagram 309.1.0.41.113 Android (33/13; 420dpi; 1080x2176; Google/google; Pixel 7; panther; qcom; en_US)"
@@ -1151,6 +1192,7 @@ jobs:
           import android.os.Bundle
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
+          import androidx.activity.SystemBarStyle
           import androidx.activity.enableEdgeToEdge
           import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.foundation.background
@@ -1229,7 +1271,29 @@ jobs:
                           vm.handleIntent(intent)
                       }
 
-                      FlowSnapTheme(darkTheme = settings.darkMode) {
+                      // Status / navigation bar icons must flip with the theme too.
+                      LaunchedEffect(settings.darkMode) {
+                          enableEdgeToEdge(
+                              statusBarStyle = if (settings.darkMode) {
+                                  SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                              } else {
+                                  SystemBarStyle.light(
+                                      android.graphics.Color.TRANSPARENT,
+                                      android.graphics.Color.TRANSPARENT
+                                  )
+                              },
+                              navigationBarStyle = if (settings.darkMode) {
+                                  SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                              } else {
+                                  SystemBarStyle.light(
+                                      android.graphics.Color.TRANSPARENT,
+                                      android.graphics.Color.TRANSPARENT
+                                  )
+                              }
+                          )
+                      }
+
+                      FlowSnapTheme(darkTheme = settings.darkMode, themeName = settings.theme) {
                           AppRoot(vm)
                       }
                   }
@@ -2313,12 +2377,10 @@ jobs:
                           }
                           HorizontalDivider(color = Stroke)
                           NavRow(Icons.Default.Palette, "App theme", value = s.theme) {
-                              val next = when (s.theme) {
-                                  "Purple" -> "Pink"
-                                  "Pink" -> "Blue"
-                                  else -> "Purple"
-                              }
+                              val i = ACCENTS.indexOfFirst { a -> a.name == s.theme }
+                              val next = ACCENTS[(i + 1).mod(ACCENTS.size)].name
                               vm.prefs.update { it.copy(theme = next) }
+                              vm.showToast("Theme: $next")
                           }
                       }
                   }
@@ -2500,55 +2562,80 @@ jobs:
           cat > app/src/main/java/com/flowsnap/app/ui/theme/Theme.kt <<'FLOWSNAP_EOF'
           package com.flowsnap.app.ui.theme
 
-          import androidx.compose.foundation.isSystemInDarkTheme
           import androidx.compose.material3.MaterialTheme
           import androidx.compose.material3.Typography
           import androidx.compose.material3.darkColorScheme
           import androidx.compose.material3.lightColorScheme
           import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.CompositionLocalProvider
+          import androidx.compose.runtime.staticCompositionLocalOf
           import androidx.compose.ui.graphics.Brush
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.text.TextStyle
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.sp
 
-          // --- FlowSnap neon palette -------------------------------------------------
-          val Ink = Color(0xFF0B0718)
-          val InkCard = Color(0xFF15102B)
-          val InkCard2 = Color(0xFF1C1540)
-          val Stroke = Color(0xFF2A2152)
+          // ---------------------------------------------------------------- raw palette
+
+          // dark surfaces
+          private val InkDark = Color(0xFF0B0718)
+          private val CardDark = Color(0xFF15102B)
+          private val Card2Dark = Color(0xFF1C1540)
+          private val StrokeDark = Color(0xFF2A2152)
+          private val TextHiDark = Color(0xFFF2EEFF)
+          private val TextLoDark = Color(0xFF9A92BF)
+
+          // light surfaces
+          private val InkLight = Color(0xFFF7F5FF)
+          private val CardLight = Color(0xFFFFFFFF)
+          private val Card2Light = Color(0xFFEFEBFF)
+          private val StrokeLight = Color(0xFFDFD8F5)
+          private val TextHiLight = Color(0xFF1A1033)
+          private val TextLoLight = Color(0xFF6C6490)
+
+          // accents
           val NeonViolet = Color(0xFF7C3AED)
-          val NeonPurple = Color(0xFFA855F7)
-          val NeonPink = Color(0xFFE935C1)
+          val NeonPurpleRaw = Color(0xFFA855F7)
+          val NeonPinkRaw = Color(0xFFE935C1)
           val NeonRose = Color(0xFFFB3B6E)
-          val NeonBlue = Color(0xFF4F8CFF)
-          val TextHi = Color(0xFFF2EEFF)
-          val TextLo = Color(0xFF9A92BF)
+          val NeonBlue = Color(0xFF3B82F6)
+          val NeonCyan = Color(0xFF22D3EE)
+          val NeonMagenta = Color(0xFFFF4D9D)
 
-          val BrandGradient = Brush.horizontalGradient(listOf(NeonViolet, NeonPink, NeonRose))
-          val BrandGradientSoft = Brush.horizontalGradient(listOf(NeonViolet.copy(alpha = .25f), NeonPink.copy(alpha = .25f)))
+          /** One selectable accent (Settings → App theme). */
+          data class Accent(val name: String, val primary: Color, val secondary: Color, val gradient: Brush)
 
-          private val DarkColors = darkColorScheme(
-              primary = NeonPurple,
-              onPrimary = Color.White,
-              secondary = NeonPink,
-              background = Ink,
-              onBackground = TextHi,
-              surface = InkCard,
-              onSurface = TextHi,
-              surfaceVariant = InkCard2,
-              onSurfaceVariant = TextLo,
-              outline = Stroke,
-              error = NeonRose
+          private val PurpleAccent = Accent(
+              "Purple", NeonPurpleRaw, NeonPinkRaw,
+              Brush.horizontalGradient(listOf(NeonViolet, NeonPinkRaw, NeonRose))
+          )
+          private val PinkAccent = Accent(
+              "Pink", NeonMagenta, NeonRose,
+              Brush.horizontalGradient(listOf(NeonMagenta, NeonRose, Color(0xFFFF7A45)))
+          )
+          private val BlueAccent = Accent(
+              "Blue", NeonBlue, NeonCyan,
+              Brush.horizontalGradient(listOf(Color(0xFF4F46E5), NeonBlue, NeonCyan))
           )
 
-          private val LightColors = lightColorScheme(
-              primary = NeonViolet,
-              secondary = NeonPink,
-              background = Color(0xFFF7F5FF),
-              surface = Color.White,
-              error = NeonRose
-          )
+          val ACCENTS = listOf(PurpleAccent, PinkAccent, BlueAccent)
+
+          fun accentFor(name: String): Accent = ACCENTS.firstOrNull { it.name == name } ?: PurpleAccent
+
+          private val LocalBrandGradient = staticCompositionLocalOf { PurpleAccent.gradient }
+
+          // ------------------------------------------------- theme-aware color accessors
+          // Used all over the UI, so light mode and the accent switcher work everywhere.
+
+          val Ink: Color @Composable get() = MaterialTheme.colorScheme.background
+          val InkCard: Color @Composable get() = MaterialTheme.colorScheme.surface
+          val InkCard2: Color @Composable get() = MaterialTheme.colorScheme.surfaceVariant
+          val Stroke: Color @Composable get() = MaterialTheme.colorScheme.outline
+          val TextHi: Color @Composable get() = MaterialTheme.colorScheme.onSurface
+          val TextLo: Color @Composable get() = MaterialTheme.colorScheme.onSurfaceVariant
+          val NeonPurple: Color @Composable get() = MaterialTheme.colorScheme.primary
+          val NeonPink: Color @Composable get() = MaterialTheme.colorScheme.secondary
+          val BrandGradient: Brush @Composable get() = LocalBrandGradient.current
 
           private val AppTypography = Typography(
               headlineSmall = TextStyle(fontWeight = FontWeight.Bold, fontSize = 24.sp),
@@ -2560,12 +2647,54 @@ jobs:
           )
 
           @Composable
-          fun FlowSnapTheme(darkTheme: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
-              MaterialTheme(
-                  colorScheme = if (darkTheme) DarkColors else LightColors,
-                  typography = AppTypography,
-                  content = content
-              )
+          fun FlowSnapTheme(
+              darkTheme: Boolean = true,
+              themeName: String = "Purple",
+              content: @Composable () -> Unit
+          ) {
+              val accent = accentFor(themeName)
+
+              val colors = if (darkTheme) {
+                  darkColorScheme(
+                      primary = accent.primary,
+                      onPrimary = Color.White,
+                      secondary = accent.secondary,
+                      onSecondary = Color.White,
+                      background = InkDark,
+                      onBackground = TextHiDark,
+                      surface = CardDark,
+                      onSurface = TextHiDark,
+                      surfaceVariant = Card2Dark,
+                      onSurfaceVariant = TextLoDark,
+                      outline = StrokeDark,
+                      error = NeonRose,
+                      onError = Color.White
+                  )
+              } else {
+                  lightColorScheme(
+                      primary = accent.primary,
+                      onPrimary = Color.White,
+                      secondary = accent.secondary,
+                      onSecondary = Color.White,
+                      background = InkLight,
+                      onBackground = TextHiLight,
+                      surface = CardLight,
+                      onSurface = TextHiLight,
+                      surfaceVariant = Card2Light,
+                      onSurfaceVariant = TextLoLight,
+                      outline = StrokeLight,
+                      error = NeonRose,
+                      onError = Color.White
+                  )
+              }
+
+              CompositionLocalProvider(LocalBrandGradient provides accent.gradient) {
+                  MaterialTheme(
+                      colorScheme = colors,
+                      typography = AppTypography,
+                      content = content
+                  )
+              }
           }
           FLOWSNAP_EOF
 
