@@ -1997,6 +1997,7 @@ jobs:
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material.icons.Icons
           import androidx.compose.material.icons.filled.Favorite
+          import androidx.compose.material.icons.filled.PlayArrow
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
@@ -2008,11 +2009,15 @@ jobs:
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.dp
           import coil.compose.AsyncImage
+          import androidx.compose.ui.platform.LocalContext
+          import com.flowsnap.app.data.MediaActions
+          import com.flowsnap.app.data.MediaKind
           import com.flowsnap.app.ui.MainViewModel
           import com.flowsnap.app.ui.theme.*
 
           @Composable
           fun FavoritesScreen(vm: MainViewModel) {
+              val context = LocalContext.current
               val all by vm.store.items.collectAsState()
               val favorites = remember(all) { all.filter { it.favorite } }
 
@@ -2036,7 +2041,7 @@ jobs:
                               Modifier.height(150.dp)
                                   .clip(RoundedCornerShape(16.dp))
                                   .background(InkCard)
-                                  .clickable { vm.store.toggleFavorite(rec.id) }
+                                  .clickable { MediaActions.open(context, rec) { msg -> vm.showToast(msg) } }
                           ) {
                               AsyncImage(
                                   model = rec.localUri.ifBlank { rec.thumbnailUrl },
@@ -2051,8 +2056,16 @@ jobs:
                                       )
                                   )
                               )
+                              if (rec.kind == MediaKind.VIDEO) {
+                                  Icon(
+                                      Icons.Default.PlayArrow,
+                                      contentDescription = null,
+                                      tint = Color.White,
+                                      modifier = Modifier.align(Alignment.Center).size(38.dp)
+                                  )
+                              }
                               Row(
-                                  Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(10.dp),
+                                  Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(start = 10.dp, end = 2.dp, bottom = 4.dp),
                                   verticalAlignment = Alignment.CenterVertically
                               ) {
                                   Column(Modifier.weight(1f)) {
@@ -2069,7 +2082,12 @@ jobs:
                                           maxLines = 1
                                       )
                                   }
-                                  Icon(Icons.Default.Favorite, null, tint = NeonPink)
+                                  IconButton(onClick = {
+                                      vm.store.toggleFavorite(rec.id)
+                                      vm.showToast("Removed from favorites")
+                                  }) {
+                                      Icon(Icons.Default.Favorite, contentDescription = "Remove from favorites", tint = NeonPink)
+                                  }
                               }
                           }
                       }
