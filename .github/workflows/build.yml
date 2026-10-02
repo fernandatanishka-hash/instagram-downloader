@@ -62,6 +62,7 @@ jobs:
           mkdir -p build-src/app/src/main/res/values
           mkdir -p build-src/app/src/main/res/drawable
           mkdir -p build-src/app/src/main/res/mipmap-anydpi-v26
+          mkdir -p build-src/app/src/main/res/xml
 
       - name: Write Gradle build files
         working-directory: build-src
@@ -259,6 +260,15 @@ jobs:
                           <data android:scheme="https" android:host="instagram.com" />
                       </intent-filter>
                   </activity>
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
               </application>
           </manifest>
           FLOWSNAP_EOF
@@ -308,6 +318,16 @@ jobs:
               <background android:drawable="@color/ic_launcher_background" />
               <foreground android:drawable="@drawable/ic_launcher_foreground" />
           </adaptive-icon>
+          FLOWSNAP_EOF
+
+          cat > app/src/main/res/xml/file_paths.xml <<'FLOWSNAP_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <external-path name="external" path="." />
+              <external-files-path name="external_files" path="." />
+              <files-path name="files" path="." />
+              <cache-path name="cache" path="." />
+          </paths>
           FLOWSNAP_EOF
 
           cat > app/src/main/res/values/colors.xml <<'FLOWSNAP_EOF'
@@ -636,8 +656,8 @@ jobs:
                       return@withContext when {
                           Net.sessionId.isBlank() -> Result.failure(
                               IllegalArgumentException(
-                                  "Stories and Highlights need a logged-in session. Add your Instagram " +
-                                      "sessionid in Settings → Instagram session, then try again."
+                                  "Stories and Highlights need a logged-in account. Open Settings → " +
+                                      "Instagram account, log in once, then try again."
                               )
                           )
                           storyId == null -> Result.failure(
@@ -658,30 +678,55 @@ jobs:
                       add("graphql" to { viaGraphqlPost(code, input) })
                       add("graphql-get" to { viaGraphqlGet(code, input) })
                       add("embed" to { viaEmbed(code, input) })
+                      add("page-json" to { viaPageJson(code, input) })
+                      // Public embed proxies — these are what make it work without a login.
+                      val isReelLink = Regex("/(reel|reels|tv)/").containsMatchIn(input)
+                      MIRRORS.forEach { host ->
+                          add(host to { viaMirror(host, code, isReelLink, input) })
+                      }
                       add("opengraph" to { viaOpenGraph(code, input) })
                       if (Net.sessionId.isNotBlank()) add("app-api" to { viaAppApi(mediaId, input) })
                   }
 
+                  // A /reel/ or /tv/ link must come back as a video. Some fallbacks can only
+                  // see the cover image — never hand that back as if it were the post.
+                  val wantsVideo = Regex("/(reel|reels|tv)/").containsMatchIn(input)
+                  var coverOnly: ResolvedPost? = null
+
                   val reasons = mutableListOf<String>()
                   for ((name, run) in attempts) {
                       val r = runCatching { run() }
-                      r.getOrNull()?.let { post ->
-                          if (post.items.isNotEmpty() && post.items.any { it.variants.isNotEmpty() }) {
-                              return@withContext Result.success(post)
-                          }
+                      val post = r.getOrNull()
+                      if (post != null && post.items.any { it.variants.isNotEmpty() }) {
+                          val hasVideo = post.items.any { it.kind == MediaKind.VIDEO }
+                          if (!wantsVideo || hasVideo) return@withContext Result.success(post)
+                          if (coverOnly == null) coverOnly = post
+                          reasons += "$name: cover image only"
+                          continue
                       }
                       reasons += "$name: ${r.exceptionOrNull()?.message?.take(60) ?: "empty"}"
+                  }
+
+                  coverOnly?.let {
+                      return@withContext Result.failure(
+                          IllegalStateException(
+                              "Only the cover image of this reel could be read — Instagram hides the video " +
+                                  "file from logged-out requests.\n\nFix: Settings → Instagram session → paste " +
+                                  "your sessionid cookie, then try again.\n\nDetails — " +
+                                  reasons.joinToString(" · ")
+                          )
+                      )
                   }
 
                   Result.failure(
                       IllegalStateException(
                           "Instagram refused every public endpoint for this link.\n\n" +
                               (if (Net.sessionId.isBlank())
-                                  "Fix: open Settings → Instagram session and paste your sessionid cookie — " +
-                                      "that makes downloads work again for posts, reels and stories.\n\n"
+                                  "Fix: open Settings → Instagram account and log in once — " +
+                                      "that makes posts, reels and stories work again.\n\n"
                               else
-                                  "Your saved session may have expired — log in again and paste a fresh " +
-                                      "sessionid in Settings.\n\n") +
+                                  "Your saved session may have expired — open Settings → Instagram " +
+                                      "account and log in again.\n\n") +
                               "Details — " + reasons.joinToString(" · ")
                       )
                   )
@@ -891,7 +936,10 @@ jobs:
                           }.getOrNull()?.let { return parseShortcodeMedia(it, code, source) }
                       }
 
-                  val videoUrl = Regex(""""video_url":"(.*?)"""").find(html)?.groupValues?.get(1)?.let { unescape(it) }
+                  // Logged-out embeds sometimes inline only the raw .mp4 link, so scan for that too.
+                  val clean = unescape(html)
+                  val videoUrl = Regex(""""video_url":"([^"]+)"""").find(clean)?.groupValues?.get(1)
+                      ?: Regex("""https://[^"'\s\\]+\.mp4[^"'\s\\]*""").find(clean)?.value
                   val imageUrl = Regex("""class="EmbeddedMediaImage"[^>]*src="(.*?)"""")
                       .find(html)?.groupValues?.get(1)?.let { htmlUnescape(it) }
                       ?: Regex(""""display_url":"(.*?)"""").find(html)?.groupValues?.get(1)?.let { unescape(it) }
@@ -911,15 +959,123 @@ jobs:
                   return ResolvedPost(code, user.ifBlank { "instagram" }, "", "", videoUrl != null, listOf(item), source)
               }
 
-              // -------------------------------------------------------------- strategy 5
+              // ------------------------------------------------- strategy 5 (page JSON)
+
+              /** Scrapes the post page itself for the inlined media JSON or any .mp4 URL. */
+              private fun viaPageJson(code: String, source: String): ResolvedPost {
+                  val html = unescape(
+                      getText("https://www.instagram.com/p/$code/", referer = "https://www.google.com/")
+                  )
+
+                  Regex(""""shortcode_media":(\{.+?\}),"viewer"""", RegexOption.DOT_MATCHES_ALL)
+                      .find(html)?.groupValues?.get(1)?.let { blob ->
+                          runCatching { JSONObject(blob) }.getOrNull()
+                              ?.let { return parseShortcodeMedia(it, code, source) }
+                      }
+
+                  val video = Regex(""""video_url":"([^"]+\.mp4[^"]*)"""").find(html)?.groupValues?.get(1)
+                      ?: Regex("""https://[^"'\s\\]+\.mp4[^"'\s\\]*""").find(html)?.value
+                  val image = Regex(""""display_url":"([^"]+)"""").find(html)?.groupValues?.get(1)
+                  val user = Regex(""""owner":\{[^}]*"username":"([^"]+)"""").find(html)?.groupValues?.get(1)
+                      ?: "instagram"
+
+                  val item = when {
+                      !video.isNullOrBlank() -> MediaItem(
+                          code, MediaKind.VIDEO, image.orEmpty(),
+                          listOf(MediaVariant("Original (Best Quality)", video))
+                      )
+                      !image.isNullOrBlank() -> MediaItem(
+                          code, MediaKind.PHOTO, image,
+                          listOf(MediaVariant("Original (Best Quality)", image))
+                      )
+                      else -> error("no media json on page")
+                  }
+                  return ResolvedPost(code, user, "", "", !video.isNullOrBlank(), listOf(item), source)
+              }
+
+              // ------------------------------------------- strategy 6 (public mirrors)
+
+              /**
+               * Public Instagram embed proxies. They fetch the post server-side (with their
+               * own residential IPs) and hand back the direct CDN media, so they work for
+               * users who are NOT logged in — which is the normal case for this app.
+               */
+              private val MIRRORS = listOf(
+                  "d.oginstagram.com",
+                  "c.instagramfix.com",
+                  "d.kkinstagram.com",
+                  "d.ddinstagram.com",
+                  "d.vxinstagram.com",
+                  "instagramez.com"
+              )
+
+              private fun viaMirror(host: String, code: String, isReel: Boolean, source: String): ResolvedPost {
+                  val path = if (isReel) "reel" else "p"
+                  val req = Request.Builder()
+                      .url("https://$host/$path/$code/")
+                      .header("User-Agent", Net.UA)
+                      .header("Accept", "*/*")
+                      .build()
+
+                  Net.client.newCall(req).execute().use { resp ->
+                      if (!resp.isSuccessful) error("HTTP ${resp.code}")
+                      val finalUrl = resp.request.url.toString()
+                      val type = resp.header("Content-Type").orEmpty()
+
+                      // Most "d." hosts just 302 straight to the .mp4 / .jpg on the CDN.
+                      if (type.startsWith("video/") || finalUrl.contains(".mp4")) {
+                          return singleItemPost(code, MediaKind.VIDEO, finalUrl, finalUrl, source, host)
+                      }
+                      if (type.startsWith("image/") ||
+                          Regex("""\.(jpg|jpeg|png|webp)(\?|$)""").containsMatchIn(finalUrl)
+                      ) {
+                          return singleItemPost(code, MediaKind.PHOTO, finalUrl, finalUrl, source, host)
+                      }
+
+                      val html = resp.body?.string().orEmpty()
+                      val video = metaOf(html, "og:video") ?: metaOf(html, "og:video:secure_url")
+                          ?: Regex("""https://[^"'\s\\]+\.mp4[^"'\s\\]*""").find(html)?.value
+                      val image = metaOf(html, "og:image")
+                      return when {
+                          !video.isNullOrBlank() ->
+                              singleItemPost(code, MediaKind.VIDEO, video, image.orEmpty(), source, host)
+                          !image.isNullOrBlank() ->
+                              singleItemPost(code, MediaKind.PHOTO, image, image, source, host)
+                          else -> error("no media")
+                      }
+                  }
+              }
+
+              private fun singleItemPost(
+                  code: String,
+                  kind: MediaKind,
+                  url: String,
+                  thumb: String,
+                  source: String,
+                  username: String
+              ) = ResolvedPost(
+                  shortcode = code,
+                  username = username,
+                  avatarUrl = "",
+                  caption = "",
+                  isReel = kind == MediaKind.VIDEO,
+                  items = listOf(
+                      MediaItem(code, kind, thumb, listOf(MediaVariant("Original (Best Quality)", url)))
+                  ),
+                  sourceUrl = source
+              )
+
+              private fun metaOf(html: String, prop: String): String? =
+                  Regex("""<meta[^>]+property=["']$prop["'][^>]+content=["'](.*?)["']""")
+                      .find(html)?.groupValues?.get(1)?.let { htmlUnescape(it) }
+                      ?: Regex("""<meta[^>]+content=["'](.*?)["'][^>]+property=["']$prop["']""")
+                          .find(html)?.groupValues?.get(1)?.let { htmlUnescape(it) }
+
+              // -------------------------------------------------------------- strategy 7
 
               private fun viaOpenGraph(code: String, source: String): ResolvedPost {
                   val html = getText("https://www.instagram.com/p/$code/", referer = "https://www.google.com/")
-                  fun meta(prop: String) =
-                      Regex("""<meta[^>]+property=["']$prop["'][^>]+content=["'](.*?)["']""")
-                          .find(html)?.groupValues?.get(1)?.let { htmlUnescape(it) }
-                          ?: Regex("""<meta[^>]+content=["'](.*?)["'][^>]+property=["']$prop["']""")
-                              .find(html)?.groupValues?.get(1)?.let { htmlUnescape(it) }
+                  fun meta(prop: String) = metaOf(html, prop)
 
                   val video = meta("og:video") ?: meta("og:video:secure_url")
                   val image = meta("og:image")
@@ -1020,6 +1176,75 @@ jobs:
 
               private fun JSONArray.lastObject(): JSONObject? =
                   if (length() == 0) null else optJSONObject(length() - 1)
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/data/MediaActions.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.data
+
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import androidx.core.content.FileProvider
+          import java.io.File
+
+          /** Open / share / delete a saved download, handling both MediaStore and file:// URIs. */
+          object MediaActions {
+
+              private fun mime(record: DownloadRecord) =
+                  if (record.kind == MediaKind.VIDEO) "video/*" else "image/*"
+
+              /** file:// URIs cannot be handed to other apps on Android 7+, wrap them. */
+              private fun shareableUri(context: Context, record: DownloadRecord): Uri? {
+                  val uri = runCatching { Uri.parse(record.localUri) }.getOrNull() ?: return null
+                  if (uri.scheme != "file") return uri
+                  val file = uri.path?.let { File(it) } ?: return null
+                  if (!file.exists()) return null
+                  return runCatching {
+                      FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+                  }.getOrNull()
+              }
+
+              fun open(context: Context, record: DownloadRecord, onError: (String) -> Unit) {
+                  val uri = shareableUri(context, record) ?: run {
+                      onError("File is no longer on this device")
+                      return
+                  }
+                  val intent = Intent(Intent.ACTION_VIEW).apply {
+                      setDataAndType(uri, mime(record))
+                      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                  }
+                  runCatching { context.startActivity(intent) }
+                      .onFailure { onError("No app can open this file") }
+              }
+
+              fun share(context: Context, record: DownloadRecord, onError: (String) -> Unit) {
+                  val uri = shareableUri(context, record) ?: run {
+                      onError("File is no longer on this device")
+                      return
+                  }
+                  val intent = Intent(Intent.ACTION_SEND).apply {
+                      type = mime(record)
+                      putExtra(Intent.EXTRA_STREAM, uri)
+                      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  }
+                  runCatching {
+                      context.startActivity(
+                          Intent.createChooser(intent, "Share ${record.fileName}")
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      )
+                  }.onFailure { onError("Could not share this file") }
+              }
+
+              /** Really removes the file from the gallery. Returns true when something was deleted. */
+              fun delete(context: Context, record: DownloadRecord): Boolean = runCatching {
+                  val uri = Uri.parse(record.localUri)
+                  if (uri.scheme == "file") {
+                      uri.path?.let { File(it).delete() } ?: false
+                  } else {
+                      context.contentResolver.delete(uri, null, null) > 0
+                  }
+              }.getOrDefault(false)
           }
           FLOWSNAP_EOF
 
@@ -1232,6 +1457,7 @@ jobs:
           import com.flowsnap.app.ui.screens.DownloadsScreen
           import com.flowsnap.app.ui.screens.FavoritesScreen
           import com.flowsnap.app.ui.screens.HomeScreen
+          import com.flowsnap.app.ui.screens.LoginScreen
           import com.flowsnap.app.ui.screens.PreviewScreen
           import com.flowsnap.app.ui.screens.SettingsScreen
           import com.flowsnap.app.ui.screens.StorageScreen
@@ -1341,7 +1567,7 @@ jobs:
                   containerColor = Ink,
                   snackbarHost = { SnackbarHost(snackbar) },
                   bottomBar = {
-                      if (currentRoute != "preview" && currentRoute != "storage") {
+                      if (currentRoute !in listOf("preview", "storage", "login")) {
                           NavigationBar(containerColor = InkCard) {
                               TABS.forEach { tab ->
                                   val selected = backStack?.destination?.hierarchy?.any { it.route == tab.route } == true
@@ -1390,7 +1616,14 @@ jobs:
                           }
                           composable("favorites") { FavoritesScreen(vm) }
                           composable("settings") {
-                              SettingsScreen(vm, onOpenStorage = { navController.navigate("storage") })
+                              SettingsScreen(
+                                  vm,
+                                  onOpenStorage = { navController.navigate("storage") },
+                                  onOpenLogin = { navController.navigate("login") }
+                              )
+                          }
+                          composable("login") {
+                              LoginScreen(vm, onDone = { navController.popBackStack() })
                           }
                           composable("storage") {
                               StorageScreen(vm, onBack = { navController.popBackStack() })
@@ -1496,6 +1729,16 @@ jobs:
                       )
                   }
                   return post.copy(items = items)
+              }
+
+              fun saveSession(sessionId: String) {
+                  prefs.update { it.copy(sessionId = sessionId) }
+                  _toast.value = "Instagram account connected"
+              }
+
+              fun clearSession() {
+                  prefs.update { it.copy(sessionId = "") }
+                  _toast.value = "Logged out"
               }
 
               fun reset() {
@@ -1651,7 +1894,6 @@ jobs:
           cat > app/src/main/java/com/flowsnap/app/ui/screens/DownloadsScreen.kt <<'FLOWSNAP_EOF'
           package com.flowsnap.app.ui.screens
 
-          import android.content.Intent
           import androidx.compose.foundation.background
           import androidx.compose.foundation.clickable
           import androidx.compose.foundation.layout.*
@@ -1667,10 +1909,8 @@ jobs:
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.draw.clip
           import androidx.compose.ui.graphics.Color
-          import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.dp
-          import androidx.core.net.toUri
           import com.flowsnap.app.data.MediaKind
           import com.flowsnap.app.ui.MainViewModel
           import com.flowsnap.app.ui.components.*
@@ -1680,7 +1920,6 @@ jobs:
 
           @Composable
           fun DownloadsScreen(vm: MainViewModel, onOpenStorage: () -> Unit) {
-              val context = LocalContext.current
               val all by vm.store.items.collectAsState()
               var filter by remember { mutableStateOf("All") }
 
@@ -1725,20 +1964,7 @@ jobs:
                       EmptyState("No downloads yet", "Paste a link on the Home tab to get started.")
                   } else {
                       LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                          items(items, key = { it.id }) { rec ->
-                              Box(Modifier.clickable {
-                                  runCatching {
-                                      val intent = Intent(Intent.ACTION_VIEW).apply {
-                                          setDataAndType(
-                                              rec.localUri.toUri(),
-                                              if (rec.kind == MediaKind.VIDEO) "video/*" else "image/*"
-                                          )
-                                          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                      }
-                                      context.startActivity(intent)
-                                  }.onFailure { vm.showToast("Cannot open this file") }
-                              }) { DownloadRow(rec, vm) }
-                          }
+                          items(items, key = { it.id }) { rec -> DownloadRow(rec, vm) }
                           item { Spacer(Modifier.height(10.dp)) }
                       }
                   }
@@ -1882,6 +2108,7 @@ jobs:
           import androidx.compose.ui.unit.dp
           import coil.compose.AsyncImage
           import com.flowsnap.app.data.DownloadRecord
+          import com.flowsnap.app.data.MediaActions
           import com.flowsnap.app.data.MediaKind
           import com.flowsnap.app.ui.MainViewModel
           import com.flowsnap.app.ui.components.*
@@ -2015,9 +2242,15 @@ jobs:
 
           @Composable
           fun DownloadRow(record: DownloadRecord, vm: MainViewModel, onDelete: (() -> Unit)? = null) {
+              val context = LocalContext.current
+              var menuOpen by remember { mutableStateOf(false) }
+
               NeonCard {
                   Row(
-                      Modifier.fillMaxWidth().padding(10.dp),
+                      Modifier
+                          .fillMaxWidth()
+                          .clickable { MediaActions.open(context, record) { vm.showToast(it) } }
+                          .padding(10.dp),
                       verticalAlignment = Alignment.CenterVertically
                   ) {
                       Box(
@@ -2055,10 +2288,176 @@ jobs:
                               tint = if (record.favorite) NeonPink else TextLo
                           )
                       }
-                      IconButton(onClick = { onDelete?.invoke() ?: vm.store.remove(record.id) }) {
-                          Icon(Icons.Default.MoreVert, null, tint = TextLo)
+                      Box {
+                          IconButton(onClick = { menuOpen = true }) {
+                              Icon(Icons.Default.MoreVert, null, tint = TextLo)
+                          }
+                          DropdownMenu(
+                              expanded = menuOpen,
+                              onDismissRequest = { menuOpen = false },
+                              containerColor = InkCard2
+                          ) {
+                              DropdownMenuItem(
+                                  text = { Text("Open", color = TextHi) },
+                                  leadingIcon = { Icon(Icons.Default.OpenInNew, null, tint = NeonPurple) },
+                                  onClick = {
+                                      menuOpen = false
+                                      MediaActions.open(context, record) { vm.showToast(it) }
+                                  }
+                              )
+                              DropdownMenuItem(
+                                  text = { Text("Share", color = TextHi) },
+                                  leadingIcon = { Icon(Icons.Default.Share, null, tint = NeonPurple) },
+                                  onClick = {
+                                      menuOpen = false
+                                      MediaActions.share(context, record) { vm.showToast(it) }
+                                  }
+                              )
+                              HorizontalDivider(color = Stroke)
+                              DropdownMenuItem(
+                                  text = { Text("Remove from list", color = TextHi) },
+                                  leadingIcon = { Icon(Icons.Default.PlaylistRemove, null, tint = TextLo) },
+                                  onClick = {
+                                      menuOpen = false
+                                      vm.store.remove(record.id)
+                                      vm.showToast("Removed from list (file kept in gallery)")
+                                  }
+                              )
+                              DropdownMenuItem(
+                                  text = { Text("Delete file", color = NeonRose) },
+                                  leadingIcon = { Icon(Icons.Default.Delete, null, tint = NeonRose) },
+                                  onClick = {
+                                      menuOpen = false
+                                      onDelete?.invoke() ?: run {
+                                          val ok = MediaActions.delete(context, record)
+                                          vm.store.remove(record.id)
+                                          vm.showToast(if (ok) "File deleted" else "Removed (file not found)")
+                                      }
+                                  }
+                              )
+                          }
                       }
                   }
+              }
+          }
+          FLOWSNAP_EOF
+
+          cat > app/src/main/java/com/flowsnap/app/ui/screens/LoginScreen.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.ui.screens
+
+          import android.annotation.SuppressLint
+          import android.webkit.CookieManager
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.ArrowBack
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.LinearProgressIndicator
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.runtime.collectAsState
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import com.flowsnap.app.ui.MainViewModel
+          import com.flowsnap.app.ui.theme.NeonPink
+          import com.flowsnap.app.ui.theme.NeonRose
+          import com.flowsnap.app.ui.theme.Stroke
+          import com.flowsnap.app.ui.theme.TextHi
+          import com.flowsnap.app.ui.theme.TextLo
+
+          /**
+           * Optional in-app Instagram login. Everything downloadable without an account keeps
+           * working without this — logging in only adds Stories, Highlights and private posts,
+           * and makes blocked reels resolve reliably.
+           *
+           * The session cookie is read straight out of the WebView and stored on the device only.
+           */
+          @SuppressLint("SetJavaScriptEnabled")
+          @Composable
+          fun LoginScreen(vm: MainViewModel, onDone: () -> Unit) {
+              val prefs by vm.prefs.state.collectAsState()
+              var loading by remember { mutableStateOf(true) }
+
+              Column(Modifier.fillMaxSize()) {
+                  Row(
+                      Modifier.fillMaxWidth().padding(end = 8.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      IconButton(onClick = onDone) { Icon(Icons.Default.ArrowBack, null, tint = TextHi) }
+                      Column(Modifier.weight(1f)) {
+                          Text("Connect Instagram", color = TextHi, style = MaterialTheme.typography.titleMedium)
+                          Text(
+                              if (prefs.sessionId.isBlank()) "Optional — unlocks stories and private posts"
+                              else "Connected",
+                              color = if (prefs.sessionId.isBlank()) TextLo else NeonPink,
+                              style = MaterialTheme.typography.bodySmall
+                          )
+                      }
+                      if (prefs.sessionId.isNotBlank()) {
+                          TextButton(onClick = {
+                              CookieManager.getInstance().removeAllCookies(null)
+                              vm.clearSession()
+                              onDone()
+                          }) { Text("Log out", color = NeonRose) }
+                      }
+                  }
+
+                  if (loading) {
+                      LinearProgressIndicator(
+                          modifier = Modifier.fillMaxWidth().height(2.dp),
+                          color = NeonPink,
+                          trackColor = Stroke
+                      )
+                  }
+
+                  AndroidView(
+                      modifier = Modifier.fillMaxSize(),
+                      factory = { ctx ->
+                          CookieManager.getInstance().setAcceptCookie(true)
+                          WebView(ctx).apply {
+                              with(this.settings) {
+                                  javaScriptEnabled = true
+                                  domStorageEnabled = true
+                              }
+                              CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                              webViewClient = object : WebViewClient() {
+                                  override fun onPageFinished(view: WebView?, url: String?) {
+                                      loading = false
+                                      val cookies = CookieManager.getInstance()
+                                          .getCookie("https://www.instagram.com").orEmpty()
+                                      val sid = cookies.split(";")
+                                          .map { it.trim() }
+                                          .firstOrNull { it.startsWith("sessionid=") }
+                                          ?.removePrefix("sessionid=")
+                                          ?.trim()
+                                      if (!sid.isNullOrBlank()) {
+                                          vm.saveSession(sid)
+                                          onDone()
+                                      }
+                                  }
+                              }
+                              loadUrl("https://www.instagram.com/accounts/login/")
+                          }
+                      }
+                  )
+                  Spacer(Modifier.height(0.dp))
               }
           }
           FLOWSNAP_EOF
@@ -2316,7 +2715,7 @@ jobs:
           import com.flowsnap.app.ui.theme.*
 
           @Composable
-          fun SettingsScreen(vm: MainViewModel, onOpenStorage: () -> Unit) {
+          fun SettingsScreen(vm: MainViewModel, onOpenStorage: () -> Unit, onOpenLogin: () -> Unit) {
               val s by vm.prefs.state.collectAsState()
               var showSessionDialog by remember { mutableStateOf(false) }
 
@@ -2391,15 +2790,22 @@ jobs:
                   NeonCard {
                       Column {
                           NavRow(
+                              Icons.Default.AccountCircle,
+                              "Instagram account",
+                              value = if (s.sessionId.isBlank()) "Not connected" else "Connected"
+                          ) { onOpenLogin() }
+                          HorizontalDivider(color = Stroke)
+                          NavRow(
                               Icons.Default.Key,
-                              "Instagram session",
-                              value = if (s.sessionId.isBlank()) "Not set" else "Connected"
+                              "Paste session cookie",
+                              value = if (s.sessionId.isBlank()) "" else "Set"
                           ) { showSessionDialog = true }
                       }
                   }
                   Text(
-                      "Optional. Paste your instagram.com `sessionid` cookie to also download Stories, " +
-                          "Highlights and posts from private accounts you follow. Stored only on this device.",
+                      "Optional. Normal posts and reels download without an account. Connecting one " +
+                          "only adds Stories, Highlights and private posts you follow — your login stays " +
+                          "on this device and is never sent anywhere else.",
                       color = TextLo,
                       style = MaterialTheme.typography.bodySmall,
                       modifier = Modifier.padding(top = 6.dp, start = 4.dp, end = 4.dp)
