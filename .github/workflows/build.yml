@@ -193,6 +193,9 @@ jobs:
               implementation("com.squareup.okhttp3:okhttp:4.12.0")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
+              // Start.io (formerly StartApp) ads — demo/test mode until a real app id is set
+              implementation("com.startapp:inapp-sdk:5.2.6")
+
               debugImplementation("androidx.compose.ui:ui-tooling")
           }
           FLOWSNAP_EOF
@@ -215,6 +218,8 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <!-- required by ad SDKs on Android 13+ -->
+              <uses-permission android:name="com.google.android.gms.permission.AD_ID" />
               <uses-permission
                   android:name="android.permission.WRITE_EXTERNAL_STORAGE"
                   android:maxSdkVersion="28" />
@@ -358,6 +363,137 @@ jobs:
       - name: Write app source (data layer)
         working-directory: build-src
         run: |
+          cat > app/src/main/java/com/flowsnap/app/data/Ads.kt <<'FLOWSNAP_EOF'
+          package com.flowsnap.app.data
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.ContextWrapper
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.Log
+          import com.startapp.sdk.adsbase.Ad
+          import com.startapp.sdk.adsbase.StartAppAd
+          import com.startapp.sdk.adsbase.StartAppSDK
+          import com.startapp.sdk.adsbase.adlisteners.AdDisplayListener
+          import com.startapp.sdk.adsbase.adlisteners.AdEventListener
+          import java.util.concurrent.atomic.AtomicBoolean
+
+          /**
+           * Start.io (formerly StartApp) interstitial ads.
+           *
+           * Currently running in DEMO mode: [DEMO_MODE] forces Start.io test ads, so nothing
+           * is monetised and no real campaigns are served. To go live:
+           *   1. create the app at https://portal.start.io and copy its App ID
+           *   2. put it in [APP_ID]
+           *   3. set [DEMO_MODE] to false
+           *
+           * Rule of the house: an ad must never block a download. Every path through
+           * [showThenRun] calls the callback exactly once — on ad close, on failure, or
+           * after [AD_TIMEOUT_MS] — so the file always downloads.
+           */
+          object Ads {
+
+              /** TODO replace with your real Start.io App ID before publishing. */
+              private const val APP_ID = "200000000"
+
+              /** true = Start.io test ads (demo). Set to false when the real APP_ID is in. */
+              private const val DEMO_MODE = true
+
+              /** Never make the user wait longer than this for an ad. */
+              private const val AD_TIMEOUT_MS = 6000L
+
+              private const val TAG = "FlowSnapAds"
+
+              private var interstitial: StartAppAd? = null
+              private var ready = false
+              private var initialised = false
+
+              fun init(context: Context) {
+                  if (initialised) return
+                  initialised = true
+                  runCatching {
+                      StartAppSDK.init(context.applicationContext, APP_ID, false)
+                      StartAppSDK.setTestAdsEnabled(DEMO_MODE)
+                      // no ad on app launch — only before downloads
+                      StartAppAd.disableSplash()
+                      preload(context)
+                  }.onFailure { Log.w(TAG, "init failed: ${it.message}") }
+              }
+
+              fun preload(context: Context) {
+                  runCatching {
+                      ready = false
+                      val ad = StartAppAd(context.applicationContext)
+                      ad.loadAd(object : AdEventListener {
+                          override fun onReceiveAd(ad: Ad) {
+                              ready = true
+                          }
+
+                          override fun onFailedToReceiveAd(ad: Ad?) {
+                              ready = false
+                              Log.d(TAG, "no ad: ${ad?.errorMessage}")
+                          }
+                      })
+                      interstitial = ad
+                  }.onFailure { Log.w(TAG, "preload failed: ${it.message}") }
+              }
+
+              /**
+               * Shows an interstitial (if one is ready) and then runs [onDone].
+               * [onDone] is guaranteed to run exactly once, on the main thread.
+               */
+              fun showThenRun(context: Context, onDone: () -> Unit) {
+                  val guard = AtomicBoolean(false)
+                  val main = Handler(Looper.getMainLooper())
+                  fun finish() {
+                      if (guard.compareAndSet(false, true)) main.post { onDone() }
+                  }
+
+                  val activity = context.findActivity()
+                  val ad = interstitial
+                  if (activity == null || ad == null || !ready) {
+                      finish()
+                      preload(context)
+                      return
+                  }
+
+                  // safety net: if the SDK never calls back, carry on anyway
+                  main.postDelayed({ finish() }, AD_TIMEOUT_MS)
+
+                  runCatching {
+                      ad.showAd(object : AdDisplayListener {
+                          override fun adHidden(ad: Ad) {
+                              finish()
+                              preload(activity)
+                          }
+
+                          override fun adDisplayed(ad: Ad) = Unit
+
+                          override fun adClicked(ad: Ad) = Unit
+
+                          override fun adNotDisplayed(ad: Ad) {
+                              finish()
+                              preload(activity)
+                          }
+                      })
+                  }.onFailure {
+                      Log.w(TAG, "show failed: ${it.message}")
+                      finish()
+                  }
+              }
+
+              private fun Context.findActivity(): Activity? {
+                  var ctx: Context? = this
+                  while (ctx is ContextWrapper) {
+                      if (ctx is Activity) return ctx
+                      ctx = ctx.baseContext
+                  }
+                  return null
+              }
+          }
+          FLOWSNAP_EOF
+
           cat > app/src/main/java/com/flowsnap/app/data/DownloadStore.kt <<'FLOWSNAP_EOF'
           package com.flowsnap.app.data
 
@@ -1505,6 +1641,7 @@ jobs:
           import androidx.navigation.compose.composable
           import androidx.navigation.compose.currentBackStackEntryAsState
           import androidx.navigation.compose.rememberNavController
+          import com.flowsnap.app.data.Ads
           import com.flowsnap.app.data.ResolveState
           import com.flowsnap.app.ui.MainViewModel
           import com.flowsnap.app.ui.screens.DownloadsScreen
@@ -1552,6 +1689,7 @@ jobs:
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  Ads.init(this)
                   enableEdgeToEdge()
 
                   setContent {
@@ -2670,6 +2808,8 @@ jobs:
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.dp
           import coil.compose.AsyncImage
+          import androidx.compose.ui.platform.LocalContext
+          import com.flowsnap.app.data.Ads
           import com.flowsnap.app.data.MediaKind
           import com.flowsnap.app.data.ResolveState
           import com.flowsnap.app.ui.MainViewModel
@@ -2678,6 +2818,7 @@ jobs:
 
           @Composable
           fun PreviewScreen(vm: MainViewModel, onBack: () -> Unit) {
+              val context = LocalContext.current
               val state by vm.state.collectAsState()
               val index by vm.selectedIndex.collectAsState()
               val progress by vm.downloadProgress.collectAsState()
@@ -2831,13 +2972,15 @@ jobs:
                               icon = Icons.Default.Download,
                               enabled = selectedVariant != null
                           ) {
-                              selectedVariant?.let { vm.download(post, item, it, index) }
+                              selectedVariant?.let { variant ->
+                                  Ads.showThenRun(context) { vm.download(post, item, variant, index) }
+                              }
                           }
 
                           if (post.items.size > 1) {
                               Spacer(Modifier.height(10.dp))
                               OutlinedButton(
-                                  onClick = { vm.downloadAll(post) },
+                                  onClick = { Ads.showThenRun(context) { vm.downloadAll(post) } },
                                   modifier = Modifier.fillMaxWidth().height(50.dp),
                                   shape = RoundedCornerShape(16.dp),
                                   border = androidx.compose.foundation.BorderStroke(1.dp, NeonPurple)
@@ -2996,6 +3139,8 @@ jobs:
                   NeonCard {
                       Column {
                           NavRow(Icons.Default.Info, "Version", value = "1.0.0") {}
+                          HorizontalDivider(color = Stroke)
+                          NavRow(Icons.Default.Campaign, "Ads", value = "Start.io · demo") {}
                           HorizontalDivider(color = Stroke)
                           NavRow(Icons.Default.Shield, "Only download content you have the right to save") {}
                       }
